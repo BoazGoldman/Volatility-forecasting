@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+node_modules
+web/node_modules
+web/dist
+.cursor

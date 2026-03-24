@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Goldmans Sandbox | Live Signals</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main class="page">
+    <section class="dashboard">
+      <header class="dashboard-header">
+        <div>
+          <p class="eyebrow">Volatility Forecasting</p>
+          <h1>Goldmans Sandbox</h1>
+        </div>
+        <span class="status-tag">Live</span>
+      </header>
+
+      <div class="metrics">
+        <article class="metric-card">
+          <p class="metric-label">Market</p>
+          <p class="metric-value" id="market-value">BTC/USDT</p>
+        </article>
+        <article class="metric-card">
+          <p class="metric-label">Last Price</p>
+          <p class="metric-value" id="last-price">--</p>
+        </article>
+        <article class="metric-card">
+          <p class="metric-label">Last Refresh</p>
+          <p class="metric-value" id="last-refresh">--</p>
+        </article>
+      </div>
+
+      <section class="chart-panel">
+        <div class="panel-title-row">
+          <h2>BTC/USDT Live Price</h2>
+          <span class="panel-subtitle" id="ws-status">Connecting...</span>
+        </div>
+        <canvas id="price-chart" width="720" height="240"></canvas>
+      </section>
+
+      <section class="chart-panel chart-panel-secondary">
+        <div class="panel-title-row">
+          <h2>BTC/USDT — 7d close + 2 prediction slots</h2>
+          <span class="panel-subtitle" id="rest-7d-status">Loading...</span>
+        </div>
+        <canvas id="chart-7d" width="720" height="220"></canvas>
+      </section>
+
+      <section id="signal-container" class="signals-panel">
+        <div class="panel-title-row">
+          <h2>Signals</h2>
+          <span class="panel-subtitle">Latest first</span>
+        </div>
+        <ul id="signal-list" class="signal-list">
+          <li class="signal-item">
+            <span class="timestamp">Loading...</span>
+            <span class="neutral">Connecting to database</span>
+          </li>
+        </ul>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    window.__WS_URL__ = "ws://localhost:8000/ws";
+    window.__API_BASE__ = "http://localhost:8000";
+  </script>
+  <script type="module" src="/src/app.ts"></script>
+</body>
+</html>

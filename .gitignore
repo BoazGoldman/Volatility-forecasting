@@ -1,0 +1,9 @@
+firebase-key.json
+.venv/
+**/__pycache__/
+*.pyc
+web/node_modules/
+web/dist/
+web/.firebase/
+*.log
+.env
