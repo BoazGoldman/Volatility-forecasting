@@ -1,19 +1,22 @@
 # Volatility Forecasting
 
-Frontend-only BTC/USDT dashboard with Binance REST:
+BTC/USDT volatility forecasting loop + dashboard:
 - current BTC/USDT price (polled every few seconds),
 - 7-day daily close chart,
-- two empty future slots (`T+1`, `T+2`) for future prediction display.
+- server-generated GARCH “range” overlays (from `main.py`) exported as JSON.
 
 ## Project Structure
 
-- `web/` - frontend app (Vite + TypeScript)
-- `src/` - Python research/modeling code (not used by website runtime)
+- `web/` - frontend app (Vite + TypeScript, Firebase Hosting)
+- `src/` - Python data/model pipeline code
+- `main.py` - long-running forecast loop (writes SQLite + exports JSON to `web/public/`)
+- `docker-compose.yml` - runs the forecast loop on a server
 
 ## Requirements
 
 - Node.js 18+ (or 20+)
 - npm
+- Docker (for running the loop on a server)
 
 ## Local Development
 
@@ -24,6 +27,25 @@ npx vite
 ```
 
 Open `http://localhost:5173`.
+
+## Forecast Loop (Docker)
+
+This runs the long-lived loop that generates:
+- `data/forecasts.db` (SQLite)
+- `web/public/forecasts.json`
+- `web/public/forecasts_10s.json`
+
+Run:
+
+```bash
+docker compose up -d --build
+```
+
+Stop:
+
+```bash
+docker compose down
+```
 
 ## Build + Firebase Hosting
 
@@ -51,5 +73,5 @@ Frontend calls Binance REST directly:
 
 ## Notes
 
-- No backend is required for website runtime.
-- If you add predictions/signals server-side later, you can re-introduce an API/WebSocket service.
+- Website runtime is static (Firebase Hosting). The loop is a separate server-side process.
+- Generated runtime artifacts (DB, JSON exports) are ignored by git.

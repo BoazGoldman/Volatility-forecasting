@@ -4,6 +4,15 @@ firebase-key.json
 *.pyc
 web/node_modules/
 web/dist/
-web/.firebase/
 *.log
 .env
+
+# Local runtime artifacts
+data/*.db
+data/*.db-*
+web/public/forecasts.json
+web/public/forecasts_10s.json
+web/public/cusum.json
+
+# Firebase hosting local cache
+web/.firebase/
