@@ -13,6 +13,8 @@ data/*.db-*
 web/public/forecasts.json
 web/public/forecasts_10s.json
 web/public/cusum.json
+web/public/errors_10s.json
+web/public/errors_24h.json
 
 # Firebase hosting local cache
 web/.firebase/

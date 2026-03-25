@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Goldmans Sandbox | Live Signals</title>
-  <link rel="stylesheet" href="/style.css?v=20260325" />
+  <link rel="stylesheet" href="/style.css?v=20260325-2" />
 </head>
 <body>
   <main class="page">
@@ -19,11 +19,11 @@
 
       <div class="metrics">
         <article class="metric-card">
-          <p class="metric-label">Market</p>
-          <p class="metric-value" id="market-value">BTC/USDT</p>
+          <p class="metric-label">Volatility forecast (for the next 10s)</p>
+          <p class="metric-value" id="market-value">—</p>
         </article>
         <article class="metric-card">
-          <p class="metric-label">Last Price</p>
+          <p class="metric-label">Prev 10s forecast error</p>
           <p class="metric-value" id="last-price">--</p>
         </article>
         <article class="metric-card">
@@ -51,17 +51,37 @@
             <span>Actual price.</span>
           </span>
         </p>
+        <div class="rollup rollup--open">
+          <div class="rollup-title">Recent 10s forecast errors</div>
+          <div class="rollup-body">
+            <ul class="rollup-list" id="errors-10s-list"></ul>
+          </div>
+        </div>
       </section>
+
+      <div class="metrics metrics--compact">
+        <article class="metric-card">
+          <p class="metric-label">24h volatility forecast</p>
+          <p class="metric-value" id="vol-24h-sigma">—</p>
+        </article>
+        <article class="metric-card">
+          <p class="metric-label">Yesterday result</p>
+          <p class="metric-value" id="yday-band">—</p>
+        </article>
+        <article class="metric-card">
+          <p class="metric-label">7d range</p>
+          <p class="metric-value">
+            <span id="chart-7d-low">—</span>
+            <span class="chart-7d-range-sep">·</span>
+            <span id="chart-7d-high">—</span>
+          </p>
+        </article>
+      </div>
 
       <section class="chart-panel chart-panel-secondary">
         <div class="panel-title-row">
           <div class="chart-7d-heading">
             <h2>BTC/USDT last 7d</h2>
-            <p class="chart-7d-range">
-              <span>Low <span class="chart-7d-num" id="chart-7d-low">—</span></span>
-              <span class="chart-7d-range-sep">·</span>
-              <span>High <span class="chart-7d-num" id="chart-7d-high">—</span></span>
-            </p>
           </div>
           <span class="panel-subtitle" id="rest-7d-status">Loading...</span>
         </div>
@@ -76,6 +96,12 @@
             <span>Actual price.</span>
           </span>
         </p>
+        <div class="rollup rollup--open">
+          <div class="rollup-title">Recent 24h forecast errors</div>
+          <div class="rollup-body">
+            <ul class="rollup-list" id="errors-24h-list"></ul>
+          </div>
+        </div>
       </section>
 
       <section id="signal-container" class="signals-panel">

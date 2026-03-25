@@ -88,6 +88,23 @@ h1 {
   margin-bottom: 18px;
 }
 
+.metrics--compact {
+  margin-bottom: 12px;
+}
+
+.metrics--compact .metric-card {
+  padding: 10px 12px;
+}
+
+.metrics--compact .metric-label {
+  font-size: 0.75rem;
+  margin-bottom: 5px;
+}
+
+.metrics--compact .metric-value {
+  font-size: 0.92rem;
+}
+
 .metric-card {
   background: var(--card-2);
   border: 1px solid var(--line);
@@ -197,6 +214,61 @@ h1 {
   gap: 0.55rem;
 }
 
+.rollup {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.rollup-title {
+  color: var(--text-dim);
+  font-size: 0.86rem;
+  font-weight: 600;
+  user-select: none;
+}
+
+.rollup-body {
+  margin-top: 8px;
+}
+
+.rollup-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: Consolas, Menlo, Monaco, monospace;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.rollup-body {
+  /* Show a small fixed window; allow scroll without growing page. */
+  max-height: 124px;
+  overflow: auto;
+  padding-right: 6px;
+}
+
+.rollup-body::-webkit-scrollbar {
+  width: 10px;
+}
+
+.rollup-body::-webkit-scrollbar-thumb {
+  background: rgba(158, 171, 201, 0.22);
+  border: 2px solid rgba(13, 20, 41, 0.9);
+  border-radius: 999px;
+}
+
+.rollup-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-top: 1px solid rgba(44, 54, 88, 0.6);
+}
+
+.rollup-list li:first-child {
+  border-top: 0;
+}
+
 .chart-legend-swatch {
   flex-shrink: 0;
   width: 2.25rem;
@@ -290,6 +362,11 @@ h2 {
 
   .metrics {
     grid-template-columns: 1fr;
+  }
+
+  /* Keep the 7d mini-metrics side-by-side even on small screens. */
+  .metrics.metrics--compact {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .signal-item {

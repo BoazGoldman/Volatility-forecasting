@@ -38,6 +38,31 @@ def init_forecasts_db(db_path: str) -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS forecast_errors (
+                symbol TEXT NOT NULL,
+                series TEXT NOT NULL,
+                event_time TEXT NOT NULL,
+                anchor_price REAL,
+                actual_price REAL,
+                sigma REAL,
+                low REAL,
+                high REAL,
+                outside_frac REAL,
+                side TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (symbol, series, event_time)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_forecast_errors_lookup
+            ON forecast_errors(symbol, series, event_time DESC)
+            """
+        )
+
 
 def upsert_forecasts(
     df: pd.DataFrame,
@@ -136,6 +161,29 @@ def read_selected_forecasts(db_path: str, symbol: str, timeframe: str) -> pd.Dat
         )
 
 
+def read_forecast_at(
+    *, db_path: str, symbol: str, timeframe: str, forecast_time_iso: str
+) -> float | None:
+    """Return garch_forecast for exact forecast_time (ISO), or None."""
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT garch_forecast
+            FROM forecasts
+            WHERE symbol = ? AND timeframe = ? AND forecast_time = ?
+            """,
+            (symbol, timeframe, forecast_time_iso),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        val = row[0]
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+
 def keep_latest_n_forecasts(
     db_path: str, symbol: str, timeframe: str, n: int
 ) -> int:
@@ -159,5 +207,105 @@ def keep_latest_n_forecasts(
               )
             """,
             (symbol, timeframe, symbol, timeframe, n),
+        )
+        return cur.rowcount
+
+
+def insert_forecast_error(
+    *,
+    db_path: str,
+    symbol: str,
+    series: str,
+    event_time_iso: str,
+    anchor_price: float | None,
+    actual_price: float | None,
+    sigma: float | None,
+    low: float | None,
+    high: float | None,
+    outside_frac: float | None,
+    side: str | None,
+) -> None:
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO forecast_errors(
+              symbol, series, event_time,
+              anchor_price, actual_price, sigma, low, high,
+              outside_frac, side
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, series, event_time)
+            DO UPDATE SET
+              anchor_price = excluded.anchor_price,
+              actual_price = excluded.actual_price,
+              sigma = excluded.sigma,
+              low = excluded.low,
+              high = excluded.high,
+              outside_frac = excluded.outside_frac,
+              side = excluded.side,
+              created_at = datetime('now')
+            """,
+            (
+                symbol,
+                series,
+                event_time_iso,
+                anchor_price,
+                actual_price,
+                sigma,
+                low,
+                high,
+                outside_frac,
+                side,
+            ),
+        )
+
+
+def read_latest_forecast_errors(
+    *, db_path: str, symbol: str, series: str, limit: int = 30
+) -> pd.DataFrame:
+    with _connect(db_path) as conn:
+        return pd.read_sql_query(
+            """
+            SELECT
+              event_time,
+              anchor_price,
+              actual_price,
+              sigma,
+              low,
+              high,
+              outside_frac,
+              side,
+              created_at
+            FROM forecast_errors
+            WHERE symbol = ? AND series = ?
+            ORDER BY event_time DESC
+            LIMIT ?
+            """,
+            conn,
+            params=(symbol, series, limit),
+        )
+
+
+def keep_latest_n_forecast_errors(
+    *, db_path: str, symbol: str, series: str, n: int = 30
+) -> int:
+    if n < 1:
+        return 0
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM forecast_errors
+            WHERE symbol = ?
+              AND series = ?
+              AND event_time NOT IN (
+                SELECT event_time
+                FROM forecast_errors
+                WHERE symbol = ?
+                  AND series = ?
+                ORDER BY event_time DESC
+                LIMIT ?
+              )
+            """,
+            (symbol, series, symbol, series, n),
         )
         return cur.rowcount
