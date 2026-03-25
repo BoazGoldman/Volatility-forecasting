@@ -7,7 +7,8 @@ from src.model import volatility_baseline_model, garch_model
 from src.evaluation import error_calculation, mae_print, rmse_print
 from src.signal import CusumSignal
 
-#----------------------DATA PIPELINES-------------------------------
+
+# ----------------------DATA PIPELINES-------------------------------
 def run_data_pipeline(
     feature_functions: list[Callable] | None = None,
     symbol: str = "BTC/USDT",
@@ -26,14 +27,16 @@ def run_data_pipeline(
     df = loader.load()
 
     if feature_functions is not None:
-        
-       for feature_fn in feature_functions:
+
+        for feature_fn in feature_functions:
 
             df = feature_fn(df)
 
     return df
 
-def run_pair_pipeline(feature_functions: list[Callable] | None = None,
+
+def run_pair_pipeline(
+    feature_functions: list[Callable] | None = None,
     symbol1: str = "BTC/USDT",
     exchange_name1: str = "binance",
     timeframe1: str = "1m",
@@ -41,32 +44,31 @@ def run_pair_pipeline(feature_functions: list[Callable] | None = None,
     symbol2: str = "DOGE/USDT",
     exchange_name2: str = "binance",
     timeframe2: str = "1m",
-    limit2: int = 2000,):
+    limit2: int = 2000,
+):
 
     df1 = DataLoader(
-    symbol=symbol1,
-    exchange_name=exchange_name1,
-    timeframe=timeframe1,
-    limit=limit1).load()
+        symbol=symbol1, exchange_name=exchange_name1, timeframe=timeframe1, limit=limit1
+    ).load()
 
     df2 = DataLoader(
-    symbol=symbol2,
-    exchange_name=exchange_name2,
-    timeframe=timeframe2,
-    limit=limit2).load()
+        symbol=symbol2, exchange_name=exchange_name2, timeframe=timeframe2, limit=limit2
+    ).load()
 
     df = features.two_coins_spread(df1, df2)
     df = df.dropna(subset=["close_1", "close_2"])
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     if feature_functions is not None:
-       for fn in feature_functions:
-           df = fn(df)
+        for fn in feature_functions:
+            df = fn(df)
 
     return df
-#----------------------SIGNAL PIPELINES-----------------------------------
+
+
+# ----------------------SIGNAL PIPELINES-----------------------------------
 def run_cusum_pipeline(df: pd.DataFrame, k_index: int = 0, h_index: int = 0):
-    
+
     cusum = CusumSignal(df, k_index=k_index, h_index=h_index)
     signals: list[int] = []
     s_pos_vals: list[float] = []
@@ -86,8 +88,34 @@ def run_cusum_pipeline(df: pd.DataFrame, k_index: int = 0, h_index: int = 0):
     df["cusum_pos"] = s_pos_vals
     df["cusum_neg"] = s_neg_vals
 
-    print(df[["timestamp", "relative_return", "cusum_pos", "cusum_neg", "cusum_signal"]].tail())
+    print(
+        df[
+            ["timestamp", "relative_return", "cusum_pos", "cusum_neg", "cusum_signal"]
+        ].tail()
+    )
     return df
+
+
+def ohlcv_1s_to_10s(df: pd.DataFrame) -> pd.DataFrame:
+    """Binance has 1s klines, not 10s; aggregate OHLCV into 10-second bars."""
+    if df.empty:
+        return df.copy()
+
+    work = df.sort_values("timestamp").set_index("timestamp")
+    agg = (
+        work.resample("10s", label="right", closed="right")
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        .dropna(subset=["close"])
+    )
+    return agg.reset_index()
 
 
 def run_garch_pipeline(
@@ -104,14 +132,22 @@ def run_garch_pipeline(
     garch_mean: str = "Constant",
     eval_window_step: int = 24,
     eval_target_shift_steps: int = 24,
+    preprocess: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
 ):
+    """
+    Load OHLCV for `timeframe`, optionally reshape with `preprocess` (e.g. `ohlcv_1s_to_10s`
+    when `timeframe='1s'`), then shared baseline + GARCH + eval path.
+    """
     df = run_data_pipeline(
-        feature_functions=[add_log_returns],
+        feature_functions=None,
         symbol=symbol,
         exchange_name=exchange_name,
         timeframe=timeframe,
         limit=limit,
     )
+    if preprocess is not None:
+        df = preprocess(df)
+    df = add_log_returns(df)
 
     df = volatility_baseline_model(df, window_step=baseline_window_step)
 
@@ -131,17 +167,31 @@ def run_garch_pipeline(
         target_shift_steps=eval_target_shift_steps,
     )
 
-    print(eval_df[["timestamp", "baseline_forecast", "garch_forecast", "actual_volatility", "garch_error", "baseline_error"]].tail())
+    print(
+        eval_df[
+            [
+                "timestamp",
+                "baseline_forecast",
+                "garch_forecast",
+                "actual_volatility",
+                "garch_error",
+                "baseline_error",
+            ]
+        ].tail()
+    )
 
     mae_print(eval_df)
     rmse_print(eval_df)
     return eval_df[["timestamp", "garch_forecast"]]
-#--------------------------------------TEST PIPELINE----------------------------------------
+
+
+# --------------------------------------TEST PIPELINE----------------------------------------
 def run_test_pipeline(
     symbol1: str = "BTC/USDT",
-    symbol2: str = "DOGE/USDT", 
+    symbol2: str = "DOGE/USDT",
     timeframe: str = "1m",
-    limit: int = 2000):
+    limit: int = 2000,
+):
 
     df = run_pair_pipeline(
         feature_functions=[features.pair_log_returns],
@@ -159,6 +209,18 @@ def run_test_pipeline(
 
     for k_index in range(3):
         for h_index in range(5):
-         new_df = run_cusum_pipeline(df_joined.copy(), k_index= k_index, h_index= h_index)
-         print(f"k_index: {k_index}, h_index: {h_index}")
-         print(new_df[["timestamp", "relative_return", "cusum_pos", "cusum_neg", "cusum_signal"]].tail())
+            new_df = run_cusum_pipeline(
+                df_joined.copy(), k_index=k_index, h_index=h_index
+            )
+            print(f"k_index: {k_index}, h_index: {h_index}")
+            print(
+                new_df[
+                    [
+                        "timestamp",
+                        "relative_return",
+                        "cusum_pos",
+                        "cusum_neg",
+                        "cusum_signal",
+                    ]
+                ].tail()
+            )

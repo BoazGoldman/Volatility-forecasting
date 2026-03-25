@@ -1,4 +1,0 @@
-# Replace with your real domain before using in production.
-api.example.com {
-    reverse_proxy backend:8000
-}

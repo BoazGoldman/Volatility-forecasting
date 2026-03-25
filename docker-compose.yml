@@ -1,0 +1,27 @@
+services:
+  forecast-loop:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: volatility-forecast-loop
+    restart: unless-stopped
+    environment:
+      # Override these on your server as needed.
+      SYMBOL: "BTC/USDT"
+      TIMEFRAME: "1h"
+      SLEEP_SECONDS: "3600"
+      TEN_SEC_MODEL_INTERVAL_SEC: "30"
+      TEN_SEC_KEEP_ROWS: "6"
+      # Use WAL on Linux servers; if you run on Docker Desktop + Windows bind mounts and see I/O errors, set this to "DELETE".
+      SQLITE_JOURNAL_MODE: "WAL"
+      DB_PATH: "/app/data/forecasts.db"
+      WEB_FORECAST_JSON: "/app/web/public/forecasts.json"
+      WEB_FORECAST_10S_JSON: "/app/web/public/forecasts_10s.json"
+    volumes:
+      # Persist the SQLite DB (use a named volume to avoid Windows bind-mount SQLite issues).
+      - forecasts-data:/app/data
+      # Export JSONs somewhere your web host can pick up (optional).
+      - ./web/public:/app/web/public
+
+volumes:
+  forecasts-data:

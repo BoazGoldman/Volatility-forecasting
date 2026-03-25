@@ -1,65 +1,21 @@
 # Volatility Forecasting
 
-Real-time BTC/USDT dashboard with:
-- a live WebSocket price stream (1m Binance kline updates),
-- a REST endpoint for the last 7 daily candles,
-- a frontend chart UI (Vite + TypeScript).
+Frontend-only BTC/USDT dashboard with Binance REST:
+- current BTC/USDT price (polled every few seconds),
+- 7-day daily close chart,
+- two empty future slots (`T+1`, `T+2`) for future prediction display.
 
 ## Project Structure
 
-- `api/server.py` - FastAPI backend (`/ws`, `/api/btc/prices/7d`, `/health`)
-- `src/` - Python modeling/signal pipeline code
-- `web/` - frontend app (Vite)
-- `docker/` - Docker and Caddy deployment files
+- `web/` - frontend app (Vite + TypeScript)
+- `src/` - Python research/modeling code (not used by website runtime)
 
 ## Requirements
 
-- Python 3.11+
 - Node.js 18+ (or 20+)
 - npm
 
 ## Local Development
-
-### 1) Backend
-
-From repo root:
-
-```bash
-python -m venv .venv
-```
-
-Activate venv:
-
-- Windows (PowerShell)
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-- Linux/macOS
-```bash
-source .venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-Run backend:
-
-```bash
-uvicorn api.server:app --reload --port 8000
-```
-
-Useful endpoints:
-- `http://localhost:8000/health`
-- `http://localhost:8000/api/btc/prices/7d`
-- `ws://localhost:8000/ws`
-
-### 2) Frontend
-
-In a second terminal:
 
 ```bash
 cd web
@@ -75,56 +31,25 @@ Build frontend:
 
 ```bash
 cd web
-npx vite build
+npm run build
 ```
 
-Deploy (Firebase Hosting is configured to publish `web/dist`):
+Deploy (Firebase Hosting publishes `web/dist`):
 
 ```bash
 cd web
 firebase deploy --only hosting
 ```
 
-## Docker
+`firebase deploy` also runs `npm run build` automatically via predeploy.
 
-Docker files are under `docker/`.
+## Data Source
 
-### Backend only
+Frontend calls Binance REST directly:
+- Current price: `https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT`
+- 7-day candles: `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=7`
 
-From repo root:
+## Notes
 
-```bash
-docker compose -f docker/docker-compose.yml up -d --build
-```
-
-Backend runs on `http://localhost:8000`.
-
-### Backend + Caddy (HTTPS/WSS)
-
-1. Edit `docker/Caddyfile` and replace `api.example.com` with your real domain.
-2. Ensure DNS points to your server and ports `80/443` are reachable.
-3. Run:
-
-```bash
-docker compose -f docker/docker-compose.caddy.yml up -d --build
-```
-
-## Config Notes
-
-Frontend runtime config lives in `web/index.html`:
-- `window.__WS_URL__` for websocket endpoint
-- `window.__API_BASE__` for REST base URL
-
-Examples:
-- Local: `ws://localhost:8000/ws`, `http://localhost:8000`
-- Production: `wss://your-domain/ws`, `https://your-domain`
-
-## Cleanup / Reproducibility
-
-Ignored generated artifacts include:
-- `.venv/`
-- `**/__pycache__/`
-- `web/node_modules/`
-- `web/dist/`
-
-Regenerate anytime with install/build commands above.
+- No backend is required for website runtime.
+- If you add predictions/signals server-side later, you can re-introduce an API/WebSocket service.

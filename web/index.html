@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Goldmans Sandbox | Live Signals</title>
-  <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/style.css?v=20260325" />
 </head>
 <body>
   <main class="page">
@@ -14,7 +14,7 @@
           <p class="eyebrow">Volatility Forecasting</p>
           <h1>Goldmans Sandbox</h1>
         </div>
-        <span class="status-tag">Live</span>
+        <!-- <span class="status-tag">Live</span> -->
       </header>
 
       <div class="metrics">
@@ -34,39 +34,60 @@
 
       <section class="chart-panel">
         <div class="panel-title-row">
-          <h2>BTC/USDT Live Price</h2>
+          <div class="live-chart-heading">
+            <h2>BTC/USDT $</h2>
+            <p class="live-chart-price" id="live-chart-price">--</p>
+          </div>
           <span class="panel-subtitle" id="ws-status">Connecting...</span>
         </div>
-        <canvas id="price-chart" width="720" height="240"></canvas>
+        <canvas id="price-chart" width="720" height="320"></canvas>
+        <p class="chart-legend" id="live-chart-legend">
+          <span class="chart-legend-row">
+            <span class="chart-legend-swatch" aria-hidden="true"></span>
+            <span>Price range according to the GARCH model volatility forecast for the next 10 seconds.</span>
+          </span>
+          <span class="chart-legend-row">
+            <span class="chart-legend-swatch chart-legend-swatch--spot" aria-hidden="true"></span>
+            <span>Actual price.</span>
+          </span>
+        </p>
       </section>
 
       <section class="chart-panel chart-panel-secondary">
         <div class="panel-title-row">
-          <h2>BTC/USDT — 7d close + 2 prediction slots</h2>
+          <div class="chart-7d-heading">
+            <h2>BTC/USDT last 7d</h2>
+            <p class="chart-7d-range">
+              <span>Low <span class="chart-7d-num" id="chart-7d-low">—</span></span>
+              <span class="chart-7d-range-sep">·</span>
+              <span>High <span class="chart-7d-num" id="chart-7d-high">—</span></span>
+            </p>
+          </div>
           <span class="panel-subtitle" id="rest-7d-status">Loading...</span>
         </div>
         <canvas id="chart-7d" width="720" height="220"></canvas>
+        <p class="chart-legend" id="chart-7d-legend">
+          <span class="chart-legend-row">
+            <span class="chart-legend-swatch" aria-hidden="true"></span>
+            <span>Price range according to the GARCH model volatility forecast for the day.</span>
+          </span>
+          <span class="chart-legend-row">
+            <span class="chart-legend-swatch chart-legend-swatch--spot" aria-hidden="true"></span>
+            <span>Actual price.</span>
+          </span>
+        </p>
       </section>
 
       <section id="signal-container" class="signals-panel">
         <div class="panel-title-row">
           <h2>Signals</h2>
-          <span class="panel-subtitle">Latest first</span>
+          <span class="panel-subtitle" id="cusum-status">Cusum</span>
         </div>
-        <ul id="signal-list" class="signal-list">
-          <li class="signal-item">
-            <span class="timestamp">Loading...</span>
-            <span class="neutral">Connecting to database</span>
-          </li>
-        </ul>
+        <ul id="signal-list" class="signal-list"></ul>
       </section>
     </section>
   </main>
 
-  <script>
-    window.__WS_URL__ = "ws://localhost:8000/ws";
-    window.__API_BASE__ = "http://localhost:8000";
-  </script>
   <script type="module" src="/src/app.ts"></script>
 </body>
 </html>

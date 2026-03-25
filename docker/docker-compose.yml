@@ -1,9 +1,0 @@
-services:
-  backend:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    container_name: volatility-backend
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
