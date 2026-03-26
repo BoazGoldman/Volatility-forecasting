@@ -156,35 +156,54 @@ function splitForecastRows(forecasts: SavedForecast[]): {
 }
 
 async function loadSavedForecasts(): Promise<SavedForecast[]> {
-  const res = await fetch(FORECASTS_JSON_URL, { cache: "no-store" });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const payload = (await res.json()) as { forecasts?: SavedForecast[] };
-  return Array.isArray(payload.forecasts) ? payload.forecasts : [];
+  // Prefer backend API; fall back to static export if running frontend standalone.
+  const tryUrls = [FORECASTS_JSON_URL, "/forecasts.json"];
+  for (const url of tryUrls) {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) continue;
+      const payload = (await res.json()) as { forecasts?: SavedForecast[] };
+      return Array.isArray(payload.forecasts) ? payload.forecasts : [];
+    } catch {
+      // try next
+    }
+  }
+  return [];
 }
 
 async function loadForecasts10sSigma(): Promise<void> {
-  try {
-    const res = await fetch(FORECASTS_10S_JSON_URL, { cache: "no-store" });
-    if (!res.ok) {
-      latest10sGarchSigma = null;
-      latest10sGarchSigmaUpdatedAtMs = Date.now();
-      return;
+  const now = Date.now();
+  const tryUrls = [FORECASTS_10S_JSON_URL, "/forecasts_10s.json"];
+  let rows: SavedForecast[] | null = null;
+  for (const url of tryUrls) {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) continue;
+      const payload = (await res.json()) as { forecasts?: SavedForecast[] };
+      if (Array.isArray(payload.forecasts) && payload.forecasts.length > 0) {
+        rows = payload.forecasts;
+        break;
+      }
+    } catch {
+      // try next
     }
-    const payload = (await res.json()) as { forecasts?: SavedForecast[] };
-    const rows = payload.forecasts;
-    if (!Array.isArray(rows) || rows.length === 0) {
-      latest10sGarchSigma = null;
-      latest10sGarchSigmaUpdatedAtMs = Date.now();
-      return;
-    }
+  }
+
+  if (!rows || rows.length === 0) {
+    latest10sGarchSigma = null;
+    latest10sGarchSigmaUpdatedAtMs = now;
+  } else {
     const top = rows[0];
     const s = top?.garch_forecast;
-    latest10sGarchSigma =
-      typeof s === "number" && Number.isFinite(s) ? Math.max(s, 0) : null;
-    latest10sGarchSigmaUpdatedAtMs = Date.now();
-  } catch {
-    latest10sGarchSigma = null;
-    latest10sGarchSigmaUpdatedAtMs = Date.now();
+    latest10sGarchSigma = typeof s === "number" && Number.isFinite(s) ? Math.max(s, 0) : null;
+    latest10sGarchSigmaUpdatedAtMs = now;
+  }
+
+  // Update the volatility card even if live price WS is down.
+  if (marketEl) {
+    const s = latest10sGarchSigma;
+    marketEl.textContent =
+      typeof s === "number" && Number.isFinite(s) && s > 0 ? `${(s * 100).toFixed(4)}%` : "—";
   }
 }
 
