@@ -36,7 +36,7 @@ services:
       SYMBOL: "BTC/USDT"
       TIMEFRAME: "1h"
       API_ALLOW_CORS: "true"
-      API_CORS_ORIGINS: "http://localhost:5173"
+      API_CORS_ORIGINS: "http://localhost:5173,https://bg-crypto-sandbox.web.app,https://bg-crypto-sandbox.firebaseapp.com"
     command: ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "8000:8000"
