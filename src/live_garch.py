@@ -158,10 +158,20 @@ def latest_closed_10s_return_pct(
     ts = pd.to_datetime(bars_10s["timestamp"], utc=True, errors="coerce")
     work = bars_10s.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
 
+    # Prefer the bar that ended exactly at `bar_end`, but tolerate exchange / fetch lag by
+    # falling back to the newest bar with timestamp <= bar_end.
     end_ts = pd.Timestamp(bar_end)
     row_t = work[work["timestamp"] == end_ts].tail(1)
+    if row_t.empty:
+        row_t = work[work["timestamp"] <= end_ts].tail(1)
+        if row_t.empty:
+            return None
+        end_ts = pd.Timestamp(row_t.iloc[0]["timestamp"])
+
     row_prev = work[work["timestamp"] == (end_ts - pd.Timedelta(seconds=10))].tail(1)
-    if row_t.empty or row_prev.empty:
+    if row_prev.empty:
+        row_prev = work[work["timestamp"] < end_ts].tail(1)
+    if row_prev.empty:
         return None
 
     close_t = float(row_t.iloc[0]["close"])

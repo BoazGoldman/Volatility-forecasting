@@ -1,7 +1,7 @@
 # Volatility Forecasting
 
 BTC/USDT volatility forecasting loop + dashboard:
-- current BTC/USDT price (polled every few seconds),
+- current BTC/USDT price (via WebSocket),
 - 7-day daily close chart,
 - server-generated GARCH “range” overlays (from `main.py`) exported as JSON.
 
@@ -10,7 +10,8 @@ BTC/USDT volatility forecasting loop + dashboard:
 - `web/` - frontend app (Vite + TypeScript, Firebase Hosting)
 - `src/` - Python data/model pipeline code
 - `main.py` - long-running forecast loop (writes SQLite + exports JSON to `web/public/`)
-- `docker-compose.yml` - runs the forecast loop on a server
+- `api/` - FastAPI backend (Uvicorn)
+- `docker/docker-compose.yml` - runs loop + API on a server
 
 ## Requirements
 
@@ -28,9 +29,19 @@ npx vite
 
 Open `http://localhost:5173`.
 
-## Forecast Loop (Docker)
+Start the API (in another terminal, from repo root):
 
-This runs the long-lived loop that generates:
+```bash
+.\.venv\Scripts\python -m uvicorn api.app:app --host 127.0.0.1 --port 8000 --reload
+```
+
+## Server (Docker Compose)
+
+This runs:
+- `forecast-loop` (long-lived loop that generates SQLite + JSON exports)
+- `api` (FastAPI + Uvicorn that serves forecasts/errors and WS price stream)
+
+Generated artifacts:
 - `data/forecasts.db` (SQLite)
 - `web/public/forecasts.json`
 - `web/public/forecasts_10s.json`
@@ -38,13 +49,13 @@ This runs the long-lived loop that generates:
 Run:
 
 ```bash
-docker compose up -d --build
+docker compose -f docker/docker-compose.yml up -d --build
 ```
 
 Stop:
 
 ```bash
-docker compose down
+docker compose -f docker/docker-compose.yml down
 ```
 
 ## Build + Firebase Hosting
@@ -67,9 +78,16 @@ firebase deploy --only hosting
 
 ## Data Source
 
-Frontend calls Binance REST directly:
-- Current price: `https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT`
-- 7-day candles: `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=7`
+Frontend uses:
+- Backend WebSocket price stream: `/ws/price` (backend proxies Binance WS)
+- Binance REST for 7-day candles (daily): `https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=7`
+
+## Firebase files
+
+- **Firestore rules/indexes** live in `web/firebase/` and are referenced by `web/firebase.json`.
+- **Service account key** should NOT be committed. If you need one locally, place it at:
+  - `web/firebase/firebase-key.json`
+  - See `web/firebase/firebase-key.example.json` for the expected shape.
 
 ## Notes
 

@@ -7,7 +7,7 @@ import math
 
 import pandas as pd
 
-from src.pipeline import ohlcv_1s_to_10s, run_garch_pipeline
+from src.pipeline import run_garch_pipeline
 from src.live_garch import (
     LiveGarch11,
     fetch_recent_bars,
@@ -22,7 +22,6 @@ from src.storage import (
     keep_only_timestamps,
     read_selected_forecasts,
     read_forecast_at,
-    select_three_midnights_plus_latest,
     upsert_forecasts,
     insert_forecast_error,
     keep_latest_n_forecast_errors,
@@ -51,9 +50,9 @@ def _env_str(name: str, default: str) -> str:
 HOURLY_FORECAST_INTERVAL_SEC = _env_int("HOURLY_FORECAST_INTERVAL_SEC", 3600)
 HOURLY_REFIT_INTERVAL_SEC = _env_int("HOURLY_REFIT_INTERVAL_SEC", 7 * 24 * 60 * 60)
 HOURLY_FETCH_LIMIT = _env_int("HOURLY_FETCH_LIMIT", 2000)
-"""How often to refit the 10s-candle GARCH (each run fetches fresh 1s data). Lower if you want; 10s fits are CPU-heavy."""
-TEN_SEC_MODEL_INTERVAL_SEC = _env_int("TEN_SEC_MODEL_INTERVAL_SEC", 10)
-TEN_SEC_LOOKBACK_SECONDS = _env_int("TEN_SEC_LOOKBACK_SECONDS", 30)
+HOURLY_KEEP_MIDNIGHTS = _env_int("HOURLY_KEEP_MIDNIGHTS", 30)
+HOURLY_BACKFILL_DAYS = _env_int("HOURLY_BACKFILL_DAYS", 14)
+"""How often to refit the 10s-candle GARCH. Lower if you want; 10s fits are CPU-heavy."""
 TEN_SEC_REFIT_INTERVAL_SEC = _env_int("TEN_SEC_REFIT_INTERVAL_SEC", 1800)
 TEN_SEC_FETCH_LIMIT_1S = _env_int("TEN_SEC_FETCH_LIMIT_1S", 1000)
 TEN_SEC_BOUNDARY_DELAY_MS = _env_int("TEN_SEC_BOUNDARY_DELAY_MS", 300)
@@ -67,8 +66,174 @@ WEB_FORECAST_10S_JSON = _env_str("WEB_FORECAST_10S_JSON", "web/public/forecasts_
 WEB_ERRORS_10S_JSON = _env_str("WEB_ERRORS_10S_JSON", "web/public/errors_10s.json")
 WEB_ERRORS_24H_JSON = _env_str("WEB_ERRORS_24H_JSON", "web/public/errors_24h.json")
 
-ERROR_LOG_KEEP_ROWS = _env_int("ERROR_LOG_KEEP_ROWS", 30)
+ERROR_LOG_KEEP_ROWS = _env_int("ERROR_LOG_KEEP_ROWS", 25)
 DAILY_ERROR_DELAY_MS = _env_int("DAILY_ERROR_DELAY_MS", 1500)
+DAILY_ERROR_BACKFILL_DAYS = _env_int("DAILY_ERROR_BACKFILL_DAYS", 20)
+
+
+def select_last_n_midnights_plus_latest(df: pd.DataFrame, *, n_midnights: int) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    out = df.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    out = out.dropna(subset=["timestamp", "garch_forecast"]).sort_values("timestamp")
+    if out.empty:
+        return out
+
+    n = max(int(n_midnights), 0)
+    midnights = out[
+        (out["timestamp"].dt.hour == 0)
+        & (out["timestamp"].dt.minute == 0)
+        & (out["timestamp"].dt.second == 0)
+    ]
+    if n > 0:
+        midnights = midnights.tail(n)
+    else:
+        midnights = midnights.tail(0)
+
+    latest_row = out.tail(1)
+    selected = pd.concat([midnights, latest_row], ignore_index=True)
+    selected = selected.drop_duplicates(subset=["timestamp"], keep="last")
+    return selected.sort_values("timestamp").copy()
+
+
+def backfill_hourly_midnights(*, days: int) -> None:
+    """
+    Recompute recent hourly forecasts and ensure we have midnight (00:00 UTC) rows in the DB.
+    This is useful if the loop was offline around midnight and the UI needs yesterday's band.
+    """
+    d = max(int(days), 0)
+    if d <= 0:
+        return
+
+    # Fetch enough 1h history to cover `days` plus a small buffer.
+    need = min(max(d * 24 + 72, 200), HOURLY_FETCH_LIMIT)
+    try:
+        df = run_garch_pipeline(
+            symbol=SYMBOL,
+            exchange_name="binance",
+            timeframe=TIMEFRAME,
+            limit=need,
+            # Use a smaller baseline window so backfill works on shorter history.
+            baseline_window_step=min(48, max(12, need // 20)),
+            garch_horizon_step=24,
+            eval_window_step=24,
+            eval_target_shift_steps=24,
+        )
+    except Exception as exc:
+        print(f"Backfill: hourly pipeline failed: {exc}")
+        return
+
+    selected = select_last_n_midnights_plus_latest(df, n_midnights=HOURLY_KEEP_MIDNIGHTS)
+    if selected.empty:
+        print("Backfill: no rows selected (empty).")
+        return
+
+    upserted = upsert_forecasts(selected, db_path=DB_PATH, symbol=SYMBOL, timeframe=TIMEFRAME)
+    keep_ts = [
+        pd.to_datetime(ts, utc=True).isoformat() for ts in selected["timestamp"].tolist()
+    ]
+    keep_only_timestamps(DB_PATH, symbol=SYMBOL, timeframe=TIMEFRAME, timestamps_iso=keep_ts)
+    _export_hourly_forecasts_json(extra={"backfill_days": d, "kept_midnights": HOURLY_KEEP_MIDNIGHTS})
+    print(f"Backfill: upserted {upserted} rows; kept {len(keep_ts)} timestamps")
+
+
+def backfill_daily_24h_errors(*, days: int) -> None:
+    """
+    Backfill the daily "24h" error series used by the 7d UI rollup (`errors_24h.json`).
+
+    For each day D (00:00 UTC), we score the close of day D (yesterday close) against the
+    midnight forecast band from D (σ stored at forecast_time=D 00:00 UTC in the hourly series).
+    """
+    d = max(int(days), 0)
+    if d <= 0:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    today_midnight = floor_dt_to_step(now_utc, 24 * 60 * 60)
+    # We can only score days strictly before today's midnight.
+    end_day = today_midnight - timedelta(days=1)
+    start_day = end_day - timedelta(days=d - 1)
+
+    try:
+        bars_1d = fetch_recent_bars(symbol=SYMBOL, exchange_name="binance", timeframe="1d", limit=d + 5)
+    except Exception as exc:
+        print(f"24h backfill: fetch 1d failed: {exc}")
+        return
+    if bars_1d.empty:
+        return
+
+    ts = pd.to_datetime(bars_1d["timestamp"], utc=True, errors="coerce")
+    work = bars_1d.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
+
+    day = start_day
+    wrote = 0
+    while day <= end_day:
+        # day is D 00:00 UTC; we need close of candle opened at D, and base close from D-1.
+        y_row = work[work["timestamp"] == pd.Timestamp(day)].tail(1)
+        prev_row = work[work["timestamp"] == pd.Timestamp(day - timedelta(days=1))].tail(1)
+        if y_row.empty or prev_row.empty:
+            day += timedelta(days=1)
+            continue
+
+        y_close = float(y_row.iloc[0]["close"])
+        base_close = float(prev_row.iloc[0]["close"])
+        if y_close <= 0 or base_close <= 0:
+            day += timedelta(days=1)
+            continue
+
+        sigma = read_forecast_at(
+            db_path=DB_PATH,
+            symbol=SYMBOL,
+            timeframe=TIMEFRAME,
+            forecast_time_iso=day.isoformat(),
+        )
+        if sigma is None or not (sigma > 0):
+            day += timedelta(days=1)
+            continue
+
+        low = base_close * (1 - sigma)
+        high = base_close * (1 + sigma)
+        lo = min(low, high)
+        hi = max(low, high)
+        side = "inside"
+        outside_frac = 0.0
+        if y_close > hi:
+            side = "above"
+            outside_frac = (y_close - hi) / base_close
+        elif y_close < lo:
+            side = "below"
+            outside_frac = (lo - y_close) / base_close
+
+        try:
+            insert_forecast_error(
+                db_path=DB_PATH,
+                symbol=SYMBOL,
+                series="24h",
+                event_time_iso=day.isoformat(),
+                anchor_price=base_close,
+                actual_price=y_close,
+                sigma=sigma,
+                low=lo,
+                high=hi,
+                outside_frac=outside_frac,
+                side=side,
+            )
+            wrote += 1
+        except Exception as exc:
+            print(f"24h backfill: write failed for {day.date().isoformat()}: {exc}")
+
+        day += timedelta(days=1)
+
+    try:
+        keep_latest_n_forecast_errors(
+            db_path=DB_PATH, symbol=SYMBOL, series="24h", n=max(ERROR_LOG_KEEP_ROWS, d + 5)
+        )
+        export_errors_json(series="24h", out_path=WEB_ERRORS_24H_JSON)
+    except Exception as exc:
+        print(f"24h backfill: prune/export failed: {exc}")
+
+    print(f"24h backfill: wrote/updated {wrote} rows ({start_day.date()}..{end_day.date()})")
 
 
 def export_forecasts_json(
@@ -223,48 +388,6 @@ def run_daily_24h_error_tick(*, last_scored_day: datetime | None) -> datetime | 
     return day_to_score
 
 
-def run_hourly_forecast_once() -> None:
-    started_at = datetime.now(timezone.utc).isoformat()
-    print(f"[{started_at}] Running hourly forecast...")
-
-    df = run_garch_pipeline(
-        symbol=SYMBOL,
-        exchange_name="binance",
-        timeframe=TIMEFRAME,
-        limit=HOURLY_FETCH_LIMIT,
-        garch_horizon_step=24,
-    )
-    selected_rows = select_three_midnights_plus_latest(df)
-    if selected_rows.empty:
-        print("No valid forecast rows found in this run. DB unchanged.")
-        return
-
-    upserted = upsert_forecasts(
-        selected_rows,
-        db_path=DB_PATH,
-        symbol=SYMBOL,
-        timeframe=TIMEFRAME,
-    )
-    keep_ts = [
-        pd.to_datetime(ts, utc=True).isoformat()
-        for ts in selected_rows["timestamp"].tolist()
-    ]
-    removed = keep_only_timestamps(
-        DB_PATH,
-        symbol=SYMBOL,
-        timeframe=TIMEFRAME,
-        timestamps_iso=keep_ts,
-    )
-    export_forecasts_json(
-        db_path=DB_PATH,
-        out_path=WEB_FORECAST_JSON,
-        symbol=SYMBOL,
-        timeframe=TIMEFRAME,
-    )
-    print(selected_rows)
-    print(f"DB upserts: {upserted}, pruned: {removed}, path: {DB_PATH}")
-
-
 def _export_hourly_forecasts_json(extra: dict | None = None) -> None:
     export_forecasts_json(
         db_path=DB_PATH,
@@ -291,7 +414,7 @@ def _keep_three_midnights_plus_latest_hourly(latest_ts_iso: str) -> None:
         (df_existing["timestamp"].dt.hour == 0)
         & (df_existing["timestamp"].dt.minute == 0)
         & (df_existing["timestamp"].dt.second == 0)
-    ].tail(3)
+    ].tail(max(0, HOURLY_KEEP_MIDNIGHTS))
 
     keep_ts = [ts.isoformat() for ts in midnights["timestamp"].tolist()]
     keep_ts.append(latest_ts_iso)
@@ -377,59 +500,6 @@ def run_hourly_live_forecast_tick(
     live.last_bar_end = bar_end
     print(f"1h live: wrote 24h σ at {ts_iso} σ={sigma_24h:.6f}")
     return live
-
-
-def run_ten_second_bar_forecast_once() -> None:
-    started_at = datetime.now(timezone.utc).isoformat()
-    print(f"[{started_at}] Running 10s-bar GARCH (from 1s klines)...")
-
-    baseline_window_10s_bars = max(1, TEN_SEC_LOOKBACK_SECONDS // 10)
-    df = run_garch_pipeline(
-        symbol=SYMBOL,
-        exchange_name="binance",
-        timeframe="1s",
-        limit=1000,
-        preprocess=ohlcv_1s_to_10s,
-        baseline_window_step=baseline_window_10s_bars,
-        garch_horizon_step=1,
-        eval_window_step=1,
-        eval_target_shift_steps=1,
-    )
-    latest = df.tail(1)
-    if latest.empty or latest["garch_forecast"].isna().all():
-        print("No 10s forecast row to save.")
-        return
-
-    upserted = upsert_forecasts(
-        latest,
-        db_path=DB_PATH,
-        symbol=SYMBOL,
-        timeframe=TEN_SEC_DB_TIMEFRAME,
-    )
-    pruned = keep_latest_n_forecasts(
-        DB_PATH,
-        symbol=SYMBOL,
-        timeframe=TEN_SEC_DB_TIMEFRAME,
-        n=TEN_SEC_KEEP_ROWS,
-    )
-    export_forecasts_json(
-        db_path=DB_PATH,
-        out_path=WEB_FORECAST_10S_JSON,
-        symbol=SYMBOL,
-        timeframe=TEN_SEC_DB_TIMEFRAME,
-        forecasts_newest_first=True,
-        extra={
-            "source_timeframe": "1s",
-            "bar_seconds": 10,
-            "garch_horizon_steps": 1,
-            "kept_forecasts": TEN_SEC_KEEP_ROWS,
-        },
-    )
-    print(latest)
-    print(
-        f"10s DB upserts: {upserted}, pruned older rows: {pruned}, "
-        f"keeping last {TEN_SEC_KEEP_ROWS}"
-    )
 
 
 def _export_latest_10s_sigma_to_web() -> None:
@@ -563,6 +633,14 @@ def run_ten_second_live_forecast_tick(
 
 def run_hourly_forecast_loop() -> None:
     init_forecasts_db(DB_PATH)
+    try:
+        backfill_hourly_midnights(days=HOURLY_BACKFILL_DAYS)
+    except Exception as exc:
+        print(f"Backfill: failed: {exc}")
+    try:
+        backfill_daily_24h_errors(days=DAILY_ERROR_BACKFILL_DAYS)
+    except Exception as exc:
+        print(f"24h backfill: failed: {exc}")
 
     next_hourly_forecast = 0.0
     last_hourly_refit_at = -1e18

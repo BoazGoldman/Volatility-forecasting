@@ -1,13 +1,13 @@
+from __future__ import annotations
+
 import pandas as pd
 from arch import arch_model
 
 
-# -------------------------------- GARCH MODEL --------------------------------
-def volatility_baseline_model(df, window_step: int = 1):
+def volatility_baseline_model(df: pd.DataFrame, *, window_step: int = 1) -> pd.DataFrame:
     df = df.copy()
     df["baseline_forecast"] = df["log_returns"].rolling(window_step).std()
-    df = df.dropna(subset=["baseline_forecast"])
-    return df
+    return df.dropna(subset=["baseline_forecast"])
 
 
 def garch_model(
@@ -42,8 +42,3 @@ def garch_model(
     df = df.join(fvol.rename("garch_forecast"), how="left")
     df = df.dropna(subset=["garch_forecast"])
     return df, res
-
-
-# ----------------------------------------------------------------------------
-
-# -------------------------------- OTHER MODELS --------------------------------

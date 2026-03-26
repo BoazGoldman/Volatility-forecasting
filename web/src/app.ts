@@ -1,7 +1,6 @@
 const MAX_POINTS = 6;
 const POLL_MS = 10_000;
-/** Pair current spot with σ from ~10s earlier (when that forecast was current). */
-const FORECAST_LOOKBACK_MS = 10_000;
+/** σ is polled periodically from backend and applied to the next realized step. */
 const prices: number[] = [];
 /**
  * `forwardForecastSigma[i]` = lagged GARCH σ for the move from anchor `prices[i]` to actual `prices[i+1]`
@@ -19,8 +18,6 @@ let pendingForwardBand:
   | null = null;
 /** Fractional step past last real index for the “next” forecast column (matches 7d gutter). */
 const LIVE_FUTURE_GUTTER = 0.28;
-/** Each poll appends `{ t, sigma }` so we can resolve σ at `now - FORECAST_LOOKBACK_MS`. */
-const sigmaSampleHistory: { t: number; sigma: number }[] = [];
 /**
  * σ observed on the previous poll. When a new price arrives, we freeze the previous step's
  * band to the σ that was available on that prior poll (so older bands never change).
@@ -28,21 +25,27 @@ const sigmaSampleHistory: { t: number; sigma: number }[] = [];
 let sigmaFromPreviousPoll: number | null = null;
 const BINANCE_SYMBOL = "BTCUSDT";
 const BINANCE_PAIR = "BTC/USDT";
-const BINANCE_PRICE_URL = `https://api.binance.com/api/v3/ticker/price?symbol=${BINANCE_SYMBOL}`;
 const BINANCE_7D_URL = `https://api.binance.com/api/v3/klines?symbol=${BINANCE_SYMBOL}&interval=1d&limit=7`;
-const FORECASTS_JSON_URL = "/forecasts.json";
-const FORECASTS_10S_JSON_URL = "/forecasts_10s.json";
 const CUSUM_JSON_URL = "/cusum.json";
-const ERRORS_10S_JSON_URL = "/errors_10s.json";
-const ERRORS_24H_JSON_URL = "/errors_24h.json";
+const API_BASE =
+  (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_BASE ??
+  "http://127.0.0.1:8000";
+const WS_BASE = API_BASE.startsWith("https://")
+  ? API_BASE.replace(/^https:/, "wss:")
+  : API_BASE.replace(/^http:/, "ws:");
+
+const FORECASTS_JSON_URL = `${API_BASE}/forecasts?symbol=${encodeURIComponent(BINANCE_PAIR)}&timeframe=1h`;
+const FORECASTS_10S_JSON_URL = `${API_BASE}/forecasts?symbol=${encodeURIComponent(BINANCE_PAIR)}&timeframe=10s&newest_first=true&limit=6`;
+const ERRORS_10S_JSON_URL = `${API_BASE}/errors?symbol=${encodeURIComponent(BINANCE_PAIR)}&series=10s&limit=30`;
+const ERRORS_24H_JSON_URL = `${API_BASE}/errors?symbol=${encodeURIComponent(BINANCE_PAIR)}&series=24h&limit=30`;
 const CUSUM_POLL_MS = 60_000;
+const SEVEN_DAY_POLL_MS = 5 * 60_000;
 /** Pixel height for both live and 7d chart canvases (must match layout). */
 const MAIN_CHART_HEIGHT = 320;
 
 /** GARCH ±σ columns, vertical range ticks, and forecast spokes (matches legend). */
 const CHART_RANGE = "#FFFFFF";
 const CHART_RANGE_STRIPE = "rgba(255, 255, 255, 0.38)";
-const CHART_RANGE_FRAME = "rgba(255, 255, 255, 0.72)";
 /** Price path (live + 7d line). */
 const CHART_PRICE_LINE = "#5E97F6";
 /** Square/circle markers on price and range bounds. */
@@ -120,6 +123,7 @@ let lastSevenDayDisplay: DailyPoint[] = [];
 let lastSavedForecasts: SavedForecast[] = [];
 /** Newest-first JSON: σ for log-return vol over the next ~10s bar; used as ± band on spot. */
 let latest10sGarchSigma: number | null = null;
+let latest10sGarchSigmaUpdatedAtMs = 0;
 
 function dateKeyUtc(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
@@ -163,42 +167,169 @@ async function loadForecasts10sSigma(): Promise<void> {
     const res = await fetch(FORECASTS_10S_JSON_URL, { cache: "no-store" });
     if (!res.ok) {
       latest10sGarchSigma = null;
+      latest10sGarchSigmaUpdatedAtMs = Date.now();
       return;
     }
     const payload = (await res.json()) as { forecasts?: SavedForecast[] };
     const rows = payload.forecasts;
     if (!Array.isArray(rows) || rows.length === 0) {
       latest10sGarchSigma = null;
+      latest10sGarchSigmaUpdatedAtMs = Date.now();
       return;
     }
     const top = rows[0];
     const s = top?.garch_forecast;
     latest10sGarchSigma =
       typeof s === "number" && Number.isFinite(s) ? Math.max(s, 0) : null;
+    latest10sGarchSigmaUpdatedAtMs = Date.now();
   } catch {
     latest10sGarchSigma = null;
+    latest10sGarchSigmaUpdatedAtMs = Date.now();
   }
 }
 
-/** Most recent σ sample with time ≤ `nowMs - FORECAST_LOOKBACK_MS` (forecast as of ~10s before this price). */
-function sigmaForPriceWith10sLag(nowMs: number): number | null {
-  const cutoff = nowMs - FORECAST_LOOKBACK_MS;
-  let bestT = -Infinity;
-  let best: number | null = null;
-  for (const row of sigmaSampleHistory) {
-    if (row.t <= cutoff && row.t > bestT) {
-      bestT = row.t;
-      best = row.sigma;
+function handleNewSpotPrice(close: number) {
+  if (!Number.isFinite(close)) return;
+  const nowMs = Date.now();
+  const sigmaForPreviousStep = sigmaFromPreviousPoll;
+
+  prices.push(close);
+  forwardForecastSigma.push(null);
+  forwardForecastLow.push(null);
+  forwardForecastHigh.push(null);
+  forwardForecastColW.push(null);
+  const nPts = prices.length;
+  if (nPts >= 2) {
+    forwardForecastSigma[nPts - 2] = sigmaForPreviousStep;
+    const anchor = prices[nPts - 2];
+    if (sigmaForPreviousStep !== null && sigmaForPreviousStep > 0 && Number.isFinite(anchor)) {
+      forwardForecastLow[nPts - 2] = anchor * (1 - sigmaForPreviousStep);
+      forwardForecastHigh[nPts - 2] = anchor * (1 + sigmaForPreviousStep);
+    }
+    layoutPriceChartCanvas();
+    if (canvas) forwardForecastColW[nPts - 2] = liveRangeColW(canvas.width, nPts);
+  }
+  if (prices.length > MAX_POINTS) {
+    prices.shift();
+    forwardForecastSigma.shift();
+    forwardForecastLow.shift();
+    forwardForecastHigh.shift();
+    forwardForecastColW.shift();
+  }
+  sigmaFromPreviousPoll =
+    latest10sGarchSigma !== null && latest10sGarchSigma > 0 ? latest10sGarchSigma : null;
+
+  const lastClose = prices[prices.length - 1];
+  if (latest10sGarchSigma !== null && latest10sGarchSigma > 0 && Number.isFinite(lastClose)) {
+    layoutPriceChartCanvas();
+    const colW = canvas ? liveRangeColW(canvas.width, prices.length) : 3;
+    pendingForwardBand = {
+      anchorPrice: lastClose,
+      sigma: latest10sGarchSigma,
+      low: lastClose * (1 - latest10sGarchSigma),
+      high: lastClose * (1 + latest10sGarchSigma),
+      colW,
+    };
+  } else {
+    pendingForwardBand = null;
+  }
+
+  drawChart();
+
+  const timestamp = new Date().toLocaleTimeString();
+  const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  if (liveChartPriceEl) {
+    liveChartPriceEl.textContent = `price: ${fmt(close)}`;
+  }
+  if (lastPriceEl) {
+    lastPriceEl.classList.remove("buy", "sell", "neutral");
+    // Realized error vs the previous step's frozen forecast band.
+    const n = prices.length;
+    let logRow: ErrorRow | null = null;
+    if (n >= 2 && sigmaForPreviousStep !== null && sigmaForPreviousStep > 0) {
+      const anchor = prices[n - 2];
+      const low = anchor * (1 - sigmaForPreviousStep);
+      const high = anchor * (1 + sigmaForPreviousStep);
+      let outsideFrac = 0;
+      let side: "inside" | "above" | "below" = "inside";
+      if (close > high) {
+        outsideFrac = (close - high) / anchor;
+        side = "above";
+      } else if (close < low) {
+        outsideFrac = (low - close) / anchor;
+        side = "below";
+      }
+      if (side === "inside") {
+        lastPriceEl.textContent = "within band";
+        lastPriceEl.classList.add("buy");
+      } else {
+        lastPriceEl.textContent = `${(outsideFrac * 100).toFixed(3)}% ${side} range`;
+        lastPriceEl.classList.add("sell");
+      }
+      logRow = {
+        event_time: new Date(nowMs).toISOString(),
+        outside_frac: outsideFrac,
+        side: side === "inside" ? "inside" : side,
+      };
+    } else {
+      lastPriceEl.textContent = "—";
+      lastPriceEl.classList.add("neutral");
+      // If forecast/refresh aren't synchronized (no usable σ yet), log a harmless placeholder.
+      logRow = { event_time: new Date(nowMs).toISOString(), outside_frac: 0, side: "inside" };
+    }
+
+    if (logRow) {
+      clientErrors10s.unshift(logRow);
+      while (clientErrors10s.length > 30) clientErrors10s.pop();
+      renderErrorRows(errors10sListEl, clientErrors10s);
     }
   }
-  return best;
+  if (lastRefreshEl) lastRefreshEl.textContent = timestamp;
+  if (marketEl) {
+    const s = latest10sGarchSigma;
+    marketEl.textContent =
+      typeof s === "number" && Number.isFinite(s) && s > 0 ? `${(s * 100).toFixed(4)}%` : "—";
+  }
 }
 
-function rememberSigmaSample(nowMs: number, sigma: number | null) {
-  if (sigma === null || sigma <= 0) return;
-  sigmaSampleHistory.push({ t: nowMs, sigma });
-  while (sigmaSampleHistory.length > 128) sigmaSampleHistory.shift();
+function startLivePriceWs() {
+  const url = `${WS_BASE}/ws/price?symbol=btcusdt&min_interval_ms=500`;
+  setWsStatus("Connecting...", "neutral");
+  let ws: WebSocket | null = null;
+  let lastUiUpdate = 0;
+  const MIN_UI_MS = 900;
+  const MAX_SIGMA_STALENESS_MS = POLL_MS * 3;
+
+  const connect = () => {
+    ws = new WebSocket(url);
+    ws.onopen = () => setWsStatus("Live (WS)", "buy");
+    ws.onclose = () => {
+      setWsStatus("WS reconnecting…", "neutral");
+      setTimeout(connect, 1200);
+    };
+    ws.onerror = () => setWsStatus("WS error", "sell");
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(String(ev.data)) as { type?: string; price?: number };
+        if (msg.type !== "trade") return;
+        const p = Number(msg.price);
+        const now = Date.now();
+        if (now - lastUiUpdate < MIN_UI_MS) return;
+        lastUiUpdate = now;
+        // Ensure σ doesn't go stale while WS prices keep flowing (e.g., if the polling interval was paused).
+        if (now - latest10sGarchSigmaUpdatedAtMs > MAX_SIGMA_STALENESS_MS) {
+          void loadForecasts10sSigma();
+        }
+        handleNewSpotPrice(p);
+      } catch {
+        // ignore
+      }
+    };
+  };
+  connect();
 }
+
+// σ is sampled from backend every POLL_MS and applied to the next realized step.
 
 function cusumClass(signal: number): "buy" | "sell" | "neutral" {
   if (signal > 0) return "buy";
@@ -817,7 +948,7 @@ async function loadSevenDayPrices() {
   rest7dStatusEl.classList.add("neutral");
 
   try {
-    const res = await fetch(BINANCE_7D_URL);
+    const res = await fetch(BINANCE_7D_URL, { cache: "no-store" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const raw = (await res.json()) as Array<[number, string, string, string, string, string]>;
     const apiPts = raw.map((row) => ({
@@ -908,124 +1039,11 @@ async function loadSevenDayPrices() {
 
 async function loadCurrentPrice() {
   try {
-    const [res] = await Promise.all([fetch(BINANCE_PRICE_URL), loadForecasts10sSigma()]);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = (await res.json()) as { symbol: string; price: string };
-    const close = Number(data.price);
-    if (!Number.isFinite(close)) return;
-
-    const nowMs = Date.now();
-    const sigmaForPreviousStep = sigmaFromPreviousPoll;
-
-    prices.push(close);
-    forwardForecastSigma.push(null);
-    forwardForecastLow.push(null);
-    forwardForecastHigh.push(null);
-    forwardForecastColW.push(null);
-    const nPts = prices.length;
-    if (nPts >= 2) {
-      forwardForecastSigma[nPts - 2] = sigmaForPreviousStep;
-      const anchor = prices[nPts - 2];
-      if (
-        sigmaForPreviousStep !== null &&
-        sigmaForPreviousStep > 0 &&
-        Number.isFinite(anchor)
-      ) {
-        forwardForecastLow[nPts - 2] = anchor * (1 - sigmaForPreviousStep);
-        forwardForecastHigh[nPts - 2] = anchor * (1 + sigmaForPreviousStep);
-      }
-      layoutPriceChartCanvas();
-      if (canvas) forwardForecastColW[nPts - 2] = liveRangeColW(canvas.width, nPts);
-    }
-    if (prices.length > MAX_POINTS) {
-      prices.shift();
-      forwardForecastSigma.shift();
-      forwardForecastLow.shift();
-      forwardForecastHigh.shift();
-      forwardForecastColW.shift();
-    }
-    rememberSigmaSample(nowMs, latest10sGarchSigma);
-    sigmaFromPreviousPoll =
-      latest10sGarchSigma !== null && latest10sGarchSigma > 0 ? latest10sGarchSigma : null;
-
-    const lastClose = prices[prices.length - 1];
-    if (latest10sGarchSigma !== null && latest10sGarchSigma > 0 && Number.isFinite(lastClose)) {
-      layoutPriceChartCanvas();
-      const colW = canvas ? liveRangeColW(canvas.width, prices.length) : 3;
-      pendingForwardBand = {
-        anchorPrice: lastClose,
-        sigma: latest10sGarchSigma,
-        low: lastClose * (1 - latest10sGarchSigma),
-        high: lastClose * (1 + latest10sGarchSigma),
-        colW,
-      };
-    } else {
-      pendingForwardBand = null;
-    }
-
-    drawChart();
-
-    const timestamp = new Date().toLocaleTimeString();
-    const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 2 });
-    if (liveChartPriceEl) {
-      liveChartPriceEl.textContent = `price: ${fmt(close)}`;
-    }
-    if (lastPriceEl) {
-      lastPriceEl.classList.remove("buy", "sell", "neutral");
-      // Realized error vs the previous step's frozen forecast band.
-      const n = prices.length;
-      let logRow: ErrorRow | null = null;
-      if (n >= 2 && sigmaForPreviousStep !== null && sigmaForPreviousStep > 0) {
-        const anchor = prices[n - 2];
-        const low = anchor * (1 - sigmaForPreviousStep);
-        const high = anchor * (1 + sigmaForPreviousStep);
-        let outsideFrac = 0;
-        let side: "inside" | "above" | "below" = "inside";
-        if (close > high) {
-          outsideFrac = (close - high) / anchor;
-          side = "above";
-        } else if (close < low) {
-          outsideFrac = (low - close) / anchor;
-          side = "below";
-        }
-        if (side === "inside") {
-          lastPriceEl.textContent = "within band";
-          lastPriceEl.classList.add("buy");
-        } else {
-          lastPriceEl.textContent = `${(outsideFrac * 100).toFixed(3)}% ${side} range`;
-          lastPriceEl.classList.add("sell");
-        }
-        logRow = {
-          event_time: new Date(nowMs).toISOString(),
-          outside_frac: outsideFrac,
-          side: side === "inside" ? "inside" : side,
-        };
-      } else {
-        lastPriceEl.textContent = "—";
-        lastPriceEl.classList.add("neutral");
-        // If forecast/refresh aren't synchronized (no usable σ yet), log a harmless placeholder.
-        logRow = { event_time: new Date(nowMs).toISOString(), outside_frac: 0, side: "inside" };
-      }
-
-      if (logRow) {
-        clientErrors10s.unshift(logRow);
-        while (clientErrors10s.length > 30) clientErrors10s.pop();
-        renderErrorRows(errors10sListEl, clientErrors10s);
-      }
-    }
-    if (lastRefreshEl) lastRefreshEl.textContent = timestamp;
-    if (marketEl) {
-      const s = latest10sGarchSigma;
-      marketEl.textContent =
-        typeof s === "number" && Number.isFinite(s) && s > 0
-          ? `${(s * 100).toFixed(4)}%`
-          : "—";
-    }
-    setWsStatus("Live","buy");
+    await loadForecasts10sSigma();
   } catch (e) {
     pendingForwardBand = null;
     if (liveChartPriceEl) liveChartPriceEl.textContent = "—";
-    setWsStatus("REST error", "sell");
+    setWsStatus("Forecast fetch error", "sell");
     console.error("price fetch", e);
   }
 }
@@ -1034,6 +1052,9 @@ drawChart();
 void loadSevenDayPrices();
 void loadCurrentPrice();
 void loadCusumSignals();
+setInterval(() => {
+  void loadSevenDayPrices();
+}, SEVEN_DAY_POLL_MS);
 setInterval(() => {
   void loadCurrentPrice();
 }, POLL_MS);
@@ -1051,3 +1072,5 @@ window.addEventListener("resize", () => {
     drawSevenDayChart(lastSevenDayDisplay);
   }, 120);
 });
+
+startLivePriceWs();

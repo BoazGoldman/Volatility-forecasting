@@ -1,3 +1,6 @@
+# NOTE:
+# Docker only reads `.dockerignore` from the build context root (this repo root).
+# We keep an identical copy at `docker/.dockerignore` for organization.
 **/__pycache__/
 **/*.pyc
 **/*.pyo

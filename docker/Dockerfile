@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY main.py /app/main.py
 COPY src /app/src
+COPY api /app/api
 
 # Optional: where the loop writes DB + JSON exports.
 RUN mkdir -p /app/data /app/web/public

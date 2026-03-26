@@ -99,28 +99,6 @@ def upsert_forecasts(
     return len(rows)
 
 
-def select_three_midnights_plus_latest(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
-
-    out = df.copy()
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
-    out = out.dropna(subset=["timestamp", "garch_forecast"]).sort_values("timestamp")
-    if out.empty:
-        return out
-
-    midnight_rows = out[
-        (out["timestamp"].dt.hour == 0)
-        & (out["timestamp"].dt.minute == 0)
-        & (out["timestamp"].dt.second == 0)
-    ].tail(3)
-
-    latest_row = out.tail(1)
-    selected = pd.concat([midnight_rows, latest_row], ignore_index=True)
-    selected = selected.drop_duplicates(subset=["timestamp"], keep="last")
-    return selected.sort_values("timestamp").tail(4).copy()
-
-
 def keep_only_timestamps(
     db_path: str,
     symbol: str,
@@ -158,6 +136,41 @@ def read_selected_forecasts(db_path: str, symbol: str, timeframe: str) -> pd.Dat
             """,
             conn,
             params=(symbol, timeframe),
+        )
+
+
+def read_forecasts(
+    *,
+    db_path: str,
+    symbol: str,
+    timeframe: str,
+    limit: int | None = None,
+    newest_first: bool = False,
+) -> pd.DataFrame:
+    order = "DESC" if newest_first else "ASC"
+    lim = None if limit is None else max(int(limit), 0)
+    with _connect(db_path) as conn:
+        if lim is None or lim == 0:
+            return pd.read_sql_query(
+                f"""
+                SELECT forecast_time AS timestamp, garch_forecast
+                FROM forecasts
+                WHERE symbol = ? AND timeframe = ?
+                ORDER BY forecast_time {order}
+                """,
+                conn,
+                params=(symbol, timeframe),
+            )
+        return pd.read_sql_query(
+            f"""
+            SELECT forecast_time AS timestamp, garch_forecast
+            FROM forecasts
+            WHERE symbol = ? AND timeframe = ?
+            ORDER BY forecast_time {order}
+            LIMIT ?
+            """,
+            conn,
+            params=(symbol, timeframe, lim),
         )
 
 

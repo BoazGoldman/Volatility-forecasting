@@ -1,7 +1,7 @@
 services:
   forecast-loop:
     build:
-      context: .
+      context: ..
       dockerfile: docker/Dockerfile
     container_name: volatility-forecast-loop
     restart: unless-stopped
@@ -12,6 +12,8 @@ services:
       SLEEP_SECONDS: "3600"
       TEN_SEC_MODEL_INTERVAL_SEC: "30"
       TEN_SEC_KEEP_ROWS: "6"
+      DAILY_ERROR_BACKFILL_DAYS: "20"
+      ERROR_LOG_KEEP_ROWS: "25"
       # Use WAL on Linux servers; if you run on Docker Desktop + Windows bind mounts and see I/O errors, set this to "DELETE".
       SQLITE_JOURNAL_MODE: "WAL"
       DB_PATH: "/app/data/forecasts.db"
@@ -21,7 +23,26 @@ services:
       # Persist the SQLite DB (use a named volume to avoid Windows bind-mount SQLite issues).
       - forecasts-data:/app/data
       # Export JSONs somewhere your web host can pick up (optional).
-      - ./web/public:/app/web/public
+      - ../web/public:/app/web/public
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: volatility-api
+    restart: unless-stopped
+    environment:
+      DB_PATH: "/app/data/forecasts.db"
+      SYMBOL: "BTC/USDT"
+      TIMEFRAME: "1h"
+      API_ALLOW_CORS: "true"
+      API_CORS_ORIGINS: "http://localhost:5173"
+    command: ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - forecasts-data:/app/data
 
 volumes:
   forecasts-data:
+
