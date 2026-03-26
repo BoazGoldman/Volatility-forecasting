@@ -42,7 +42,10 @@ DEFAULT_TIMEFRAME = _env_str("TIMEFRAME", "1h")
 ALLOW_CORS = _env_bool("API_ALLOW_CORS", True)
 ALLOWED_ORIGINS = [
     o.strip()
-    for o in _env_str("API_CORS_ORIGINS", "http://localhost:5173").split(",")
+    for o in _env_str(
+        "API_CORS_ORIGINS",
+        "http://localhost:5173,https://bg-crypto-sandbox.web.app,https://bg-crypto-sandbox.firebaseapp.com",
+    ).split(",")
     if o.strip()
 ]
 

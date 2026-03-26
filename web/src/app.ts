@@ -519,6 +519,7 @@ function drawChart() {
   const defaultColW = liveRangeColW(width, n);
   const dotSide = 8;
   const liveDotRadius = 5.2;
+  const MIN_BAND_PX = 6; // purely visual minimum so tiny σ doesn't collapse to a 1px line
   /* Band from anchor prices[i] (7d-style) drawn at x of actual outcome prices[i+1]. */
   for (let i = 0; i < n - 1; i += 1) {
     const low = forwardForecastLow[i];
@@ -528,9 +529,11 @@ function drawChart() {
     const x = xAtIdx(i + 1);
     const yHi = yAt(high);
     const yLo = yAt(low);
-    const topY = Math.min(yHi, yLo);
-    const hBand = Math.abs(yLo - yHi);
-    const bandH = Math.max(hBand, 1);
+    const midY = (yHi + yLo) / 2;
+    const hBandRaw = Math.abs(yLo - yHi);
+    const bandH = Math.max(hBandRaw, MIN_BAND_PX);
+    let topY = midY - bandH / 2;
+    topY = Math.max(pad, Math.min(topY, height - pad - bandH));
     const left = x - colW / 2;
 
     ctx.save();
@@ -595,9 +598,11 @@ function drawChart() {
     const xFuture = xAtIdx(n);
     const yLow = yAt(low);
     const yHigh = yAt(high);
-    const topY = Math.min(yLow, yHigh);
-    const hBand = Math.abs(yHigh - yLow);
-    const bandH = Math.max(hBand, 1);
+    const midY = (yLow + yHigh) / 2;
+    const hBandRaw = Math.abs(yHigh - yLow);
+    const bandH = Math.max(hBandRaw, MIN_BAND_PX);
+    let topY = midY - bandH / 2;
+    topY = Math.max(pad, Math.min(topY, height - pad - bandH));
     const colW = pendingForwardBand.colW || defaultColW;
     const left = xFuture - colW / 2;
 
