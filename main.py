@@ -63,7 +63,6 @@ SYMBOL = _env_str("SYMBOL", "BTC/USDT")
 TIMEFRAME = _env_str("TIMEFRAME", "1h")
 WEB_FORECAST_JSON = _env_str("WEB_FORECAST_JSON", "web/public/forecasts.json")
 WEB_FORECAST_10S_JSON = _env_str("WEB_FORECAST_10S_JSON", "web/public/forecasts_10s.json")
-WEB_ERRORS_10S_JSON = _env_str("WEB_ERRORS_10S_JSON", "web/public/errors_10s.json")
 WEB_ERRORS_24H_JSON = _env_str("WEB_ERRORS_24H_JSON", "web/public/errors_24h.json")
 
 ERROR_LOG_KEEP_ROWS = _env_int("ERROR_LOG_KEEP_ROWS", 25)
@@ -565,42 +564,6 @@ def run_ten_second_live_forecast_tick(
 
     r_pct, close_t = rr
 
-    # If we already had a sigma for this bar_end (from previous tick), log realized error now.
-    if hasattr(live, "_prev_sigma_next") and hasattr(live, "_prev_anchor_close") and hasattr(live, "_prev_forecast_for"):
-        try:
-            prev_for: datetime = getattr(live, "_prev_forecast_for")
-            prev_sigma: float | None = getattr(live, "_prev_sigma_next")
-            prev_anchor: float | None = getattr(live, "_prev_anchor_close")
-            if prev_sigma is not None and prev_anchor is not None and prev_for == bar_end:
-                low = prev_anchor * (1 - prev_sigma)
-                high = prev_anchor * (1 + prev_sigma)
-                side = "inside"
-                outside_frac = 0.0
-                if close_t > max(low, high):
-                    side = "above"
-                    outside_frac = (close_t - max(low, high)) / prev_anchor
-                elif close_t < min(low, high):
-                    side = "below"
-                    outside_frac = (min(low, high) - close_t) / prev_anchor
-                insert_forecast_error(
-                    db_path=DB_PATH,
-                    symbol=SYMBOL,
-                    series="10s",
-                    event_time_iso=bar_end.isoformat(),
-                    anchor_price=prev_anchor,
-                    actual_price=close_t,
-                    sigma=prev_sigma,
-                    low=min(low, high),
-                    high=max(low, high),
-                    outside_frac=outside_frac,
-                    side=side,
-                )
-                keep_latest_n_forecast_errors(
-                    db_path=DB_PATH, symbol=SYMBOL, series="10s", n=ERROR_LOG_KEEP_ROWS
-                )
-                export_errors_json(series="10s", out_path=WEB_ERRORS_10S_JSON)
-        except Exception as exc:
-            print(f"10s live: error log failed: {exc}")
     sigma_next = live.update_with_return_pct(r_pct)
     if not pd.notna(sigma_next) or not (sigma_next > 0):
         return live
