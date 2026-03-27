@@ -14,17 +14,12 @@
           <p class="eyebrow">Volatility Forecasting</p>
           <h1>Goldmans Sandbox</h1>
         </div>
-        <!-- <span class="status-tag">Live</span> -->
       </header>
 
       <div class="metrics">
         <article class="metric-card">
-          <p class="metric-label">Volatility forecast (for the next 10s)</p>
+          <p class="metric-label">Volatility forecast (next 10s, refreshed every 10s)</p>
           <p class="metric-value" id="market-value">—</p>
-        </article>
-        <article class="metric-card">
-          <p class="metric-label">Prev 10s forecast error</p>
-          <p class="metric-value" id="last-price">--</p>
         </article>
         <article class="metric-card">
           <p class="metric-label">Last Refresh</p>
@@ -44,19 +39,13 @@
         <p class="chart-legend" id="live-chart-legend">
           <span class="chart-legend-row">
             <span class="chart-legend-swatch" aria-hidden="true"></span>
-            <span>Price range according to the GARCH model volatility forecast for the next 10 seconds.</span>
+            <span>Price range according to the GARCH model volatility forecast (next 10s, refreshed every 10s).</span>
           </span>
           <span class="chart-legend-row">
             <span class="chart-legend-swatch chart-legend-swatch--spot" aria-hidden="true"></span>
             <span>Actual price.</span>
           </span>
         </p>
-        <div class="rollup rollup--open">
-          <div class="rollup-title">Recent 10s forecast errors</div>
-          <div class="rollup-body">
-            <ul class="rollup-list" id="errors-10s-list"></ul>
-          </div>
-        </div>
       </section>
 
       <div class="metrics metrics--compact">

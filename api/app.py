@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import asyncio
 import json
@@ -13,6 +14,106 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.storage import read_forecasts, read_latest_forecast_errors
 
 import websockets
+
+
+class _BinanceTradeHub:
+    """
+    One upstream Binance trade WebSocket per stream; fan out snapshots to many browser clients.
+    Avoids N parallel Binance connections when multiple tabs/users are connected.
+    """
+
+    def __init__(self, stream: str) -> None:
+        self.stream = stream
+        self.url = f"wss://stream.binance.com:9443/ws/{stream}"
+        self._guard = asyncio.Lock()
+        self._consumers = 0
+        self._task: asyncio.Task[None] | None = None
+        self.latest_trade: dict[str, Any] | None = None
+        self.latest_event_ms: int | None = None
+
+    async def acquire(self) -> None:
+        async with self._guard:
+            self._consumers += 1
+            if self._task is None:
+                self._task = asyncio.create_task(self._upstream_loop(), name=f"binance-hub-{self.stream}")
+
+    async def release(self) -> None:
+        task_to_cancel: asyncio.Task[None] | None = None
+        async with self._guard:
+            self._consumers = max(0, self._consumers - 1)
+            if self._consumers == 0 and self._task is not None:
+                task_to_cancel = self._task
+                self._task = None
+                self.latest_trade = None
+                self.latest_event_ms = None
+        if task_to_cancel is not None:
+            task_to_cancel.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task_to_cancel
+
+    async def _upstream_loop(self) -> None:
+        runner = asyncio.current_task()
+        backoff = 1.0
+        try:
+            while True:
+                async with self._guard:
+                    if self._consumers <= 0:
+                        return
+                try:
+                    async with websockets.connect(
+                        self.url, ping_interval=20, ping_timeout=20
+                    ) as upstream:
+                        backoff = 1.0
+                        while True:
+                            async with self._guard:
+                                if self._consumers <= 0:
+                                    return
+                            raw = await upstream.recv()
+                            try:
+                                data = json.loads(raw)
+                                p_raw = data.get("p")
+                                t_raw = data.get("T")
+                                if p_raw is not None and t_raw is not None:
+                                    event_ms = int(t_raw)
+                                    sym = str(data.get("s", "")).strip().upper()
+                                    if not sym:
+                                        sym = self.stream.split("@", 1)[0].upper()
+                                    self.latest_trade = {
+                                        "type": "trade",
+                                        "symbol": sym,
+                                        "price": float(p_raw),
+                                        "event_time": datetime.fromtimestamp(
+                                            event_ms / 1000, tz=timezone.utc
+                                        ).isoformat(),
+                                    }
+                                    self.latest_event_ms = event_ms
+                            except Exception:
+                                continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await asyncio.sleep(min(backoff, 30.0))
+                    backoff = min(backoff * 1.8, 30.0)
+        except asyncio.CancelledError:
+            return
+        finally:
+            async with self._guard:
+                if self._task is runner:
+                    self._task = None
+
+
+_trade_hubs: dict[str, _BinanceTradeHub] = {}
+_hubs_lock = asyncio.Lock()
+
+
+async def _hub_for_stream(stream: str) -> _BinanceTradeHub:
+    key = stream.lower()
+    async with _hubs_lock:
+        hub = _trade_hubs.get(key)
+        if hub is None:
+            hub = _BinanceTradeHub(key)
+            _trade_hubs[key] = hub
+        return hub
 
 
 def _env_str(name: str, default: str) -> str:
@@ -69,7 +170,7 @@ def root() -> dict[str, Any]:
         "endpoints": {
             "health": "/health",
             "forecasts": "/forecasts?symbol=BTC/USDT&timeframe=1h",
-            "errors": "/errors?series=10s&symbol=BTC/USDT&limit=30",
+            "errors": "/errors?series=24h&symbol=BTC/USDT&limit=30",
             "docs": "/docs",
         },
     }
@@ -162,42 +263,33 @@ async def ws_price(
     symbol: str = Query(default="btcusdt", description="Binance symbol, lowercase (e.g. btcusdt)"),
     min_interval_ms: int = Query(default=500, ge=100, le=10_000),
 ) -> None:
-    await ws.accept()
     stream = f"{symbol.lower()}@trade"
-    url = f"wss://stream.binance.com:9443/ws/{stream}"
-
-    last_sent = 0.0
+    hub = await _hub_for_stream(stream)
+    await hub.acquire()
+    interval_s = float(min_interval_ms) / 1000.0
+    loop = asyncio.get_running_loop()
+    next_emit = loop.time() + interval_s
+    last_sent_event_ms: int | None = None
     try:
-        async with websockets.connect(url, ping_interval=20, ping_timeout=20) as upstream:
-            await ws.send_json(
-                {"type": "status", "status": "connected", "source": "binance", "stream": stream}
-            )
-            while True:
-                msg = await upstream.recv()
-                now = asyncio.get_event_loop().time() * 1000.0
-                if now - last_sent < float(min_interval_ms):
-                    continue
-                last_sent = now
+        await ws.accept()
+        await ws.send_json(
+            {"type": "status", "status": "connected", "source": "binance", "stream": stream}
+        )
+        while True:
+            timeout_s = max(0.0, next_emit - loop.time())
+            await asyncio.sleep(timeout_s)
 
-                try:
-                    data = json.loads(msg)
-                    p_raw = data.get("p")
-                    t_raw = data.get("T")
-                    if p_raw is None or t_raw is None:
-                        continue
-                    price = float(p_raw)
-                    event_ms = int(t_raw)
-                except Exception:
-                    continue
-
-                await ws.send_json(
-                    {
-                        "type": "trade",
-                        "symbol": symbol.upper(),
-                        "price": price,
-                        "event_time": datetime.fromtimestamp(event_ms / 1000, tz=timezone.utc).isoformat(),
-                    }
-                )
+            now = loop.time()
+            if now >= next_emit:
+                payload = hub.latest_trade
+                ev = hub.latest_event_ms
+                if payload is not None and ev is not None and ev != last_sent_event_ms:
+                    out = dict(payload)
+                    out["symbol"] = symbol.upper()
+                    await ws.send_json(out)
+                    last_sent_event_ms = ev
+                while next_emit <= now:
+                    next_emit += interval_s
     except WebSocketDisconnect:
         return
     except Exception as exc:
@@ -206,4 +298,6 @@ async def ws_price(
         except Exception:
             pass
         return
+    finally:
+        await hub.release()
 

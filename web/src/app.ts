@@ -1,4 +1,25 @@
-const MAX_POINTS = 6;
+import {
+  MAX_POINTS,
+  drawLiveForecastChart,
+  latest10sGarchSigma,
+  latest10sGarchSigmaUpdatedAtMs,
+  layoutPriceChartCanvas,
+  liveRangeColW,
+  loadForecasts10sSigma,
+  refreshLiveForecastRangeLabel,
+  shiftLiveChartAfterRingBufferPop,
+  tryActivatePendingTunnel,
+  type SavedForecast,
+} from "./graphs/liveForecast10sChart";
+import {
+  dailyPointsFromApi,
+  dateKeyUtc,
+  drawSevenDayChart,
+  layoutChart7dCanvas,
+  splitForecastRows,
+  type DailyPoint,
+} from "./graphs/sevenDayChart";
+
 const POLL_MS = 10_000;
 /** σ is polled periodically from backend and applied to the next realized step. */
 const prices: number[] = [];
@@ -16,8 +37,6 @@ const forwardForecastColW: (number | null)[] = [];
 let pendingForwardBand:
   | { anchorPrice: number; sigma: number; low: number; high: number; colW: number }
   | null = null;
-/** Fractional step past last real index for the “next” forecast column (matches 7d gutter). */
-const LIVE_FUTURE_GUTTER = 0.28;
 /**
  * σ observed on the previous poll. When a new price arrives, we freeze the previous step's
  * band to the σ that was available on that prior poll (so older bands never change).
@@ -35,57 +54,21 @@ const WS_BASE = API_BASE.startsWith("https://")
   : API_BASE.replace(/^http:/, "ws:");
 
 const FORECASTS_JSON_URL = `${API_BASE}/forecasts?symbol=${encodeURIComponent(BINANCE_PAIR)}&timeframe=1h`;
-const FORECASTS_10S_JSON_URL = `${API_BASE}/forecasts?symbol=${encodeURIComponent(BINANCE_PAIR)}&timeframe=10s&newest_first=true&limit=6`;
-const ERRORS_10S_JSON_URL = `${API_BASE}/errors?symbol=${encodeURIComponent(BINANCE_PAIR)}&series=10s&limit=30`;
 const ERRORS_24H_JSON_URL = `${API_BASE}/errors?symbol=${encodeURIComponent(BINANCE_PAIR)}&series=24h&limit=30`;
 const CUSUM_POLL_MS = 60_000;
-const SEVEN_DAY_POLL_MS = 5 * 60_000;
-/** Pixel height for both live and 7d chart canvases (must match layout). */
-const MAIN_CHART_HEIGHT = 320;
-
-/** GARCH ±σ columns, vertical range ticks, and forecast spokes (matches legend). */
-const CHART_RANGE = "#FFFFFF";
-const CHART_RANGE_STRIPE = "rgba(255, 255, 255, 0.38)";
-/** Price path (live + 7d line). */
-const CHART_PRICE_LINE = "#5E97F6";
-/** Square/circle markers on price and range bounds. */
-const CHART_DOT = "#76C893";
-const CHART_DOT_7D = CHART_PRICE_LINE;
-/** Live chart: dot when realized price is outside the lagged forecast band. */
-const CHART_DOT_OUTSIDE = "#FF5252";
-/** Live chart dot styling (keep geometry identical; only add glow/outline). */
-const LIVE_DOT_SHADOW_COLOR_INSIDE = "rgba(118, 200, 147, 0.95)";
-const LIVE_DOT_SHADOW_COLOR_OUTSIDE = "rgba(255, 82, 82, 0.95)";
-const LIVE_DOT_SHADOW_BLUR = 14;
-const LIVE_DOT_OUTLINE_COLOR = "rgba(13, 20, 41, 0.96)";
-const LIVE_DOT_OUTLINE_WIDTH = 2;
+/** 7d Binance klines + saved forecasts: schedule reloads at these UTC hours only. */
+const SEVEN_DAY_UTC_RELOAD_HOURS = [0, 12] as const;
 
 const wsStatusEl = document.getElementById("ws-status");
 const liveChartPriceEl = document.getElementById("live-chart-price");
-const lastPriceEl = document.getElementById("last-price");
 const lastRefreshEl = document.getElementById("last-refresh");
 const marketEl = document.getElementById("market-value");
-const canvas = document.getElementById("price-chart") as HTMLCanvasElement | null;
-const ctx = canvas?.getContext("2d") ?? null;
-const canvas7d = document.getElementById("chart-7d") as HTMLCanvasElement | null;
-const ctx7d = canvas7d?.getContext("2d") ?? null;
 const rest7dStatusEl = document.getElementById("rest-7d-status");
-const chart7dLowEl = document.getElementById("chart-7d-low");
-const chart7dHighEl = document.getElementById("chart-7d-high");
 const vol24hSigmaEl = document.getElementById("vol-24h-sigma");
 const ydayBandEl = document.getElementById("yday-band");
 const signalListEl = document.getElementById("signal-list") as HTMLUListElement | null;
 const cusumStatusEl = document.getElementById("cusum-status");
-const errors10sListEl = document.getElementById("errors-10s-list") as HTMLUListElement | null;
 const errors24hListEl = document.getElementById("errors-24h-list") as HTMLUListElement | null;
-
-// Client-side 10s error history (kept in-memory) so logs match each UI refresh.
-const clientErrors10s: ErrorRow[] = [];
-
-type DailyPoint = { open_time: number; close: number | null; label?: string };
-type SavedForecast = { timestamp: string; garch_forecast: number };
-
-const MS_PER_DAY = 86_400_000;
 
 /** Rows exported from Python (e.g. web/public/cusum.json). */
 type CusumSignalRow = {
@@ -96,64 +79,8 @@ type CusumSignalRow = {
   detail?: string;
 };
 
-function dailyPointsFromApi(apiPoints: { open_time: number; close: number }[]): DailyPoint[] {
-  if (apiPoints.length === 0) return [];
-  const normalized: DailyPoint[] = apiPoints.map((p) => ({
-    open_time: p.open_time,
-    close: p.close,
-  }));
-  const last = apiPoints[apiPoints.length - 1];
-  const tTomorrow = last.open_time + MS_PER_DAY;
-  const d = new Date(tTomorrow);
-  const label = `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
-  return [...normalized, { open_time: tTomorrow, close: null, label }];
-}
-
-/** Start stroke slightly past the last-real dot so lines do not visually cut through it. */
-function lineStartAfterDot(x0: number, y0: number, x1: number, y1: number, dotRadius: number): [number, number] {
-  const dx = x1 - x0;
-  const dy = y1 - y0;
-  const len = Math.hypot(dx, dy);
-  if (len < 1e-6) return [x0, y0];
-  const t = Math.min((dotRadius + 1) / len, 1);
-  return [x0 + dx * t, y0 + dy * t];
-}
-
 let lastSevenDayDisplay: DailyPoint[] = [];
 let lastSavedForecasts: SavedForecast[] = [];
-/** Newest-first JSON: σ for log-return vol over the next ~10s bar; used as ± band on spot. */
-let latest10sGarchSigma: number | null = null;
-let latest10sGarchSigmaUpdatedAtMs = 0;
-
-function dateKeyUtc(ms: number): string {
-  return new Date(ms).toISOString().slice(0, 10);
-}
-
-function splitForecastRows(forecasts: SavedForecast[]): {
-  latest: SavedForecast | null;
-  historicalMidnights: SavedForecast[];
-} {
-  if (forecasts.length === 0) {
-    return { latest: null, historicalMidnights: [] };
-  }
-
-  const sorted = [...forecasts].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
-  const latest = sorted[sorted.length - 1];
-  const midnightRows = sorted.filter((f) => {
-    const t = new Date(f.timestamp);
-    return t.getUTCHours() === 0 && t.getUTCMinutes() === 0 && t.getUTCSeconds() === 0;
-  });
-
-  /*
-   * Last up to 3 UTC midnights as column overlays (each σ is drawn on that calendar day).
-   * Do not use slice(-3,-1): that dropped the newest midnight (e.g. Mar 24) so its band
-   * never appeared on that day — only “tomorrow” used latest.
-   */
-  const historicalMidnights =
-    midnightRows.length >= 3 ? midnightRows.slice(-3) : midnightRows.slice();
-
-  return { latest, historicalMidnights };
-}
 
 async function loadSavedForecasts(): Promise<SavedForecast[]> {
   // Prefer backend API; fall back to static export if running frontend standalone.
@@ -171,45 +98,18 @@ async function loadSavedForecasts(): Promise<SavedForecast[]> {
   return [];
 }
 
-async function loadForecasts10sSigma(): Promise<void> {
-  const now = Date.now();
-  const tryUrls = [FORECASTS_10S_JSON_URL, "/forecasts_10s.json"];
-  let rows: SavedForecast[] | null = null;
-  for (const url of tryUrls) {
-    try {
-      const res = await fetch(url, { cache: "no-store" });
-      if (!res.ok) continue;
-      const payload = (await res.json()) as { forecasts?: SavedForecast[] };
-      if (Array.isArray(payload.forecasts) && payload.forecasts.length > 0) {
-        rows = payload.forecasts;
-        break;
-      }
-    } catch {
-      // try next
-    }
-  }
-
-  if (!rows || rows.length === 0) {
-    latest10sGarchSigma = null;
-    latest10sGarchSigmaUpdatedAtMs = now;
-  } else {
-    const top = rows[0];
-    const s = top?.garch_forecast;
-    latest10sGarchSigma = typeof s === "number" && Number.isFinite(s) ? Math.max(s, 0) : null;
-    latest10sGarchSigmaUpdatedAtMs = now;
-  }
-
-  // Update the volatility card even if live price WS is down.
-  if (marketEl) {
-    const s = latest10sGarchSigma;
-    marketEl.textContent =
-      typeof s === "number" && Number.isFinite(s) && s > 0 ? `${(s * 100).toFixed(4)}%` : "—";
-  }
+function getLiveForecastSeries() {
+  return {
+    prices,
+    forwardForecastSigma,
+    forwardForecastLow,
+    forwardForecastHigh,
+    pendingForwardBand,
+  };
 }
 
 function handleNewSpotPrice(close: number) {
   if (!Number.isFinite(close)) return;
-  const nowMs = Date.now();
   const sigmaForPreviousStep = sigmaFromPreviousPoll;
 
   prices.push(close);
@@ -226,7 +126,8 @@ function handleNewSpotPrice(close: number) {
       forwardForecastHigh[nPts - 2] = anchor * (1 + sigmaForPreviousStep);
     }
     layoutPriceChartCanvas();
-    if (canvas) forwardForecastColW[nPts - 2] = liveRangeColW(canvas.width, nPts);
+    const livePriceCanvas = document.getElementById("price-chart") as HTMLCanvasElement | null;
+    if (livePriceCanvas) forwardForecastColW[nPts - 2] = liveRangeColW(livePriceCanvas.width, nPts);
   }
   if (prices.length > MAX_POINTS) {
     prices.shift();
@@ -234,6 +135,7 @@ function handleNewSpotPrice(close: number) {
     forwardForecastLow.shift();
     forwardForecastHigh.shift();
     forwardForecastColW.shift();
+    shiftLiveChartAfterRingBufferPop();
   }
   sigmaFromPreviousPoll =
     latest10sGarchSigma !== null && latest10sGarchSigma > 0 ? latest10sGarchSigma : null;
@@ -241,7 +143,8 @@ function handleNewSpotPrice(close: number) {
   const lastClose = prices[prices.length - 1];
   if (latest10sGarchSigma !== null && latest10sGarchSigma > 0 && Number.isFinite(lastClose)) {
     layoutPriceChartCanvas();
-    const colW = canvas ? liveRangeColW(canvas.width, prices.length) : 3;
+    const livePriceCanvas = document.getElementById("price-chart") as HTMLCanvasElement | null;
+    const colW = livePriceCanvas ? liveRangeColW(livePriceCanvas.width, prices.length) : 3;
     pendingForwardBand = {
       anchorPrice: lastClose,
       sigma: latest10sGarchSigma,
@@ -253,56 +156,16 @@ function handleNewSpotPrice(close: number) {
     pendingForwardBand = null;
   }
 
-  drawChart();
+  tryActivatePendingTunnel(prices);
+  drawLiveForecastChart(getLiveForecastSeries);
 
   const timestamp = new Date().toLocaleTimeString();
   const fmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 2 });
   if (liveChartPriceEl) {
     liveChartPriceEl.textContent = `price: ${fmt(close)}`;
   }
-  if (lastPriceEl) {
-    lastPriceEl.classList.remove("buy", "sell", "neutral");
-    // Realized error vs the previous step's frozen forecast band.
-    const n = prices.length;
-    let logRow: ErrorRow | null = null;
-    if (n >= 2 && sigmaForPreviousStep !== null && sigmaForPreviousStep > 0) {
-      const anchor = prices[n - 2];
-      const low = anchor * (1 - sigmaForPreviousStep);
-      const high = anchor * (1 + sigmaForPreviousStep);
-      let outsideFrac = 0;
-      let side: "inside" | "above" | "below" = "inside";
-      if (close > high) {
-        outsideFrac = (close - high) / anchor;
-        side = "above";
-      } else if (close < low) {
-        outsideFrac = (low - close) / anchor;
-        side = "below";
-      }
-      if (side === "inside") {
-        lastPriceEl.textContent = "within band";
-        lastPriceEl.classList.add("buy");
-      } else {
-        lastPriceEl.textContent = `${(outsideFrac * 100).toFixed(3)}% ${side} range`;
-        lastPriceEl.classList.add("sell");
-      }
-      logRow = {
-        event_time: new Date(nowMs).toISOString(),
-        outside_frac: outsideFrac,
-        side: side === "inside" ? "inside" : side,
-      };
-    } else {
-      lastPriceEl.textContent = "—";
-      lastPriceEl.classList.add("neutral");
-      // If forecast/refresh aren't synchronized (no usable σ yet), log a harmless placeholder.
-      logRow = { event_time: new Date(nowMs).toISOString(), outside_frac: 0, side: "inside" };
-    }
+  refreshLiveForecastRangeLabel(prices);
 
-    if (logRow) {
-      clientErrors10s.unshift(logRow);
-      while (clientErrors10s.length > 30) clientErrors10s.pop();
-      renderErrorRows(errors10sListEl, clientErrors10s);
-    }
-  }
   if (lastRefreshEl) lastRefreshEl.textContent = timestamp;
   if (marketEl) {
     const s = latest10sGarchSigma;
@@ -312,19 +175,71 @@ function handleNewSpotPrice(close: number) {
 }
 
 function startLivePriceWs() {
-  const url = `${WS_BASE}/ws/price?symbol=btcusdt&min_interval_ms=500`;
+  const url = `${WS_BASE}/ws/price?symbol=btcusdt&min_interval_ms=1000`;
   setWsStatus("Connecting...", "neutral");
   let ws: WebSocket | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let visibilityHideTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Exponential backoff (ms) after drops / Wi‑Fi flaps — caps load on the API. */
+  let reconnectDelayMs = 1200;
+  const RECONNECT_DELAY_MAX_MS = 30_000;
+  const HIDDEN_DISCONNECT_MS = 15_000;
   let lastUiUpdate = 0;
   const MIN_UI_MS = 900;
   const MAX_SIGMA_STALENESS_MS = POLL_MS * 3;
 
+  const clearReconnectTimer = () => {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  };
+
+  const scheduleReconnect = () => {
+    if (document.visibilityState !== "visible") return;
+    clearReconnectTimer();
+    const jitter = 200 + Math.floor(Math.random() * 400);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, reconnectDelayMs + jitter);
+    reconnectDelayMs = Math.min(
+      Math.floor(reconnectDelayMs * 1.85),
+      RECONNECT_DELAY_MAX_MS,
+    );
+  };
+
+  const disconnect = () => {
+    clearReconnectTimer();
+    if (ws !== null) {
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      ws = null;
+    }
+  };
+
   const connect = () => {
+    if (document.visibilityState !== "visible") return;
     ws = new WebSocket(url);
-    ws.onopen = () => setWsStatus("Live (WS)", "buy");
+    ws.onopen = () => {
+      reconnectDelayMs = 1200;
+      setWsStatus("Live (WS)", "buy");
+    };
     ws.onclose = () => {
-      setWsStatus("WS reconnecting…", "neutral");
-      setTimeout(connect, 1200);
+      ws = null;
+      if (document.visibilityState === "visible") {
+        setWsStatus("WS reconnecting…", "neutral");
+        scheduleReconnect();
+      } else {
+        setWsStatus("WS paused (tab in background)", "neutral");
+      }
     };
     ws.onerror = () => setWsStatus("WS error", "sell");
     ws.onmessage = (ev) => {
@@ -337,7 +252,7 @@ function startLivePriceWs() {
         lastUiUpdate = now;
         // Ensure σ doesn't go stale while WS prices keep flowing (e.g., if the polling interval was paused).
         if (now - latest10sGarchSigmaUpdatedAtMs > MAX_SIGMA_STALENESS_MS) {
-          void loadForecasts10sSigma();
+          void loadForecasts10sSigma(prices);
         }
         handleNewSpotPrice(p);
       } catch {
@@ -345,10 +260,31 @@ function startLivePriceWs() {
       }
     };
   };
-  connect();
-}
 
-// σ is sampled from backend every POLL_MS and applied to the next realized step.
+  const onVisibility = () => {
+    if (visibilityHideTimer !== null) {
+      clearTimeout(visibilityHideTimer);
+      visibilityHideTimer = null;
+    }
+    if (document.visibilityState === "visible") {
+      reconnectDelayMs = 1200;
+      if (ws === null || ws.readyState === WebSocket.CLOSED) {
+        setWsStatus("Connecting...", "neutral");
+        clearReconnectTimer();
+        connect();
+      }
+    } else {
+      visibilityHideTimer = setTimeout(() => {
+        visibilityHideTimer = null;
+        disconnect();
+        setWsStatus("WS paused (tab in background)", "neutral");
+      }, HIDDEN_DISCONNECT_MS);
+    }
+  };
+
+  document.addEventListener("visibilitychange", onVisibility);
+  onVisibility();
+}
 
 function cusumClass(signal: number): "buy" | "sell" | "neutral" {
   if (signal > 0) return "buy";
@@ -436,533 +372,11 @@ async function loadErrorLog(url: string): Promise<ErrorRow[]> {
   return Array.isArray(payload.errors) ? payload.errors : [];
 }
 
-function layoutChart7dCanvas() {
-  if (!canvas7d) return;
-  const panel = canvas7d.closest(".chart-panel");
-  const raw = panel ? panel.clientWidth - 8 : canvas7d.clientWidth || 720;
-  const w = Math.max(260, Math.min(Math.floor(raw), 1600));
-  canvas7d.width = w;
-  canvas7d.height = MAIN_CHART_HEIGHT;
-}
-
-function layoutPriceChartCanvas() {
-  if (!canvas) return;
-  const panel = canvas.closest(".chart-panel");
-  const raw = panel ? panel.clientWidth - 8 : canvas.clientWidth || 720;
-  const w = Math.max(260, Math.min(Math.floor(raw), 1600));
-  canvas.width = w;
-  canvas.height = MAIN_CHART_HEIGHT;
-}
-
 function setWsStatus(text: string, klass: "buy" | "sell" | "neutral" = "neutral") {
   if (!wsStatusEl) return;
   wsStatusEl.textContent = text;
   wsStatusEl.classList.remove("buy", "sell", "neutral");
   wsStatusEl.classList.add(klass);
-}
-
-function liveRangeColW(canvasWidth: number, nPoints: number): number {
-  const pad = 20;
-  return Math.max(
-    2,
-    Math.min(4, ((canvasWidth - pad * 2) / Math.max(nPoints * 5, 14)) * 0.55),
-  );
-}
-
-function drawChart() {
-  layoutPriceChartCanvas();
-  if (!canvas || !ctx) return;
-  const width = canvas.width;
-  const height = canvas.height;
-  const pad = 20;
-
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#0d1429";
-  ctx.fillRect(0, 0, width, height);
-
-  ctx.strokeStyle = "#253055";
-  ctx.lineWidth = 1;
-  for (let i = 0; i < 4; i += 1) {
-    const y = pad + ((height - pad * 2) * i) / 3;
-    ctx.beginPath();
-    ctx.moveTo(pad, y);
-    ctx.lineTo(width - pad, y);
-    ctx.stroke();
-  }
-
-  if (prices.length < 2) {
-    ctx.fillStyle = "#9eabc9";
-    ctx.font = "13px Segoe UI";
-    ctx.fillText("Waiting for Binance REST data...", 24, height / 2);
-    return;
-  }
-
-  let minP = Math.min(...prices);
-  let maxP = Math.max(...prices);
-  const nPre = prices.length;
-  for (let i = 0; i < nPre - 1; i += 1) {
-    const sig = forwardForecastSigma[i];
-    if (sig === null || sig <= 0) continue;
-    const anchor = prices[i];
-    if (!Number.isFinite(anchor)) continue;
-    minP = Math.min(minP, anchor * (1 - sig), anchor * (1 + sig));
-    maxP = Math.max(maxP, anchor * (1 - sig), anchor * (1 + sig));
-  }
-  if (pendingForwardBand !== null && pendingForwardBand.sigma > 0) {
-    const a = pendingForwardBand.anchorPrice;
-    const s = pendingForwardBand.sigma;
-    if (Number.isFinite(a)) {
-      minP = Math.min(minP, a * (1 - s), a * (1 + s));
-      maxP = Math.max(maxP, a * (1 - s), a * (1 + s));
-    }
-  }
-  const padPct = 0.02;
-  const padAbs = Math.max((maxP - minP) * padPct, 0.000001);
-  minP -= padAbs;
-  maxP += padAbs;
-  const range = Math.max(maxP - minP, 0.000001);
-  const plotH = height - pad * 2;
-  const yAt = (p: number) => height - pad - ((p - minP) / range) * plotH;
-
-  const n = prices.length;
-  const lastIdx = n - 1;
-  const hasPending =
-    pendingForwardBand !== null &&
-    pendingForwardBand.sigma > 0 &&
-    Number.isFinite(pendingForwardBand.anchorPrice);
-  /* Future column uses index n; span must be > n or it clips past the right pad. */
-  const xSpan = hasPending
-    ? Math.max(n + LIVE_FUTURE_GUTTER, 1e-6)
-    : Math.max(lastIdx, 1e-6);
-  const xAtIdx = (idx: number) => pad + ((width - pad * 2) * idx) / xSpan;
-  const defaultColW = liveRangeColW(width, n);
-  const dotSide = 8;
-  const liveDotRadius = 5.2;
-  const MIN_BAND_PX = 6; // purely visual minimum so tiny σ doesn't collapse to a 1px line
-  /* Band from anchor prices[i] (7d-style) drawn at x of actual outcome prices[i+1]. */
-  for (let i = 0; i < n - 1; i += 1) {
-    const low = forwardForecastLow[i];
-    const high = forwardForecastHigh[i];
-    if (low === null || high === null) continue;
-    const colW = forwardForecastColW[i] ?? defaultColW;
-    const x = xAtIdx(i + 1);
-    const yHi = yAt(high);
-    const yLo = yAt(low);
-    const midY = (yHi + yLo) / 2;
-    const hBandRaw = Math.abs(yLo - yHi);
-    const bandH = Math.max(hBandRaw, MIN_BAND_PX);
-    let topY = midY - bandH / 2;
-    topY = Math.max(pad, Math.min(topY, height - pad - bandH));
-    const left = x - colW / 2;
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(left, topY, colW, bandH);
-    ctx.clip();
-
-    ctx.strokeStyle = CHART_RANGE_STRIPE;
-    ctx.lineWidth = 1;
-    ctx.setLineDash([2, 3]);
-    const stride = 4;
-    for (let s = left - bandH; s <= left + colW + bandH; s += stride) {
-      ctx.beginPath();
-      ctx.moveTo(s, topY);
-      ctx.lineTo(s + bandH, topY + bandH);
-      ctx.stroke();
-    }
-    ctx.restore();
-
-    // Single range line (avoid the two vertical edges of a rectangle frame).
-    ctx.strokeStyle = CHART_RANGE;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(x, topY);
-    ctx.lineTo(x, topY + bandH);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    // Range endpoints (ticks) for this step.
-    ctx.strokeStyle = CHART_RANGE;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([]);
-    const capLen = Math.max(6, dotSide);
-    ctx.beginPath();
-    ctx.moveTo(x - capLen / 2, yLo);
-    ctx.lineTo(x + capLen / 2, yLo);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(x - capLen / 2, yHi);
-    ctx.lineTo(x + capLen / 2, yHi);
-    ctx.stroke();
-  }
-
-  /* Segment i-1 → i: actual price path. */
-  ctx.strokeStyle = CHART_PRICE_LINE;
-  ctx.lineWidth = 2;
-  ctx.setLineDash([]);
-  for (let i = 1; i < n; i += 1) {
-    ctx.beginPath();
-    ctx.moveTo(xAtIdx(i - 1), yAt(prices[i - 1]));
-    ctx.lineTo(xAtIdx(i), yAt(prices[i]));
-    ctx.stroke();
-  }
-
-  /* Future column: stripy band + one pair of red spokes from last anchor (7d tomorrow style). */
-  if (hasPending && pendingForwardBand !== null) {
-    const anchor = pendingForwardBand.anchorPrice;
-    const sig = pendingForwardBand.sigma;
-    const low = pendingForwardBand.low;
-    const high = pendingForwardBand.high;
-    const xFuture = xAtIdx(n);
-    const yLow = yAt(low);
-    const yHigh = yAt(high);
-    const midY = (yLow + yHigh) / 2;
-    const hBandRaw = Math.abs(yHigh - yLow);
-    const bandH = Math.max(hBandRaw, MIN_BAND_PX);
-    let topY = midY - bandH / 2;
-    topY = Math.max(pad, Math.min(topY, height - pad - bandH));
-    const colW = pendingForwardBand.colW || defaultColW;
-    const left = xFuture - colW / 2;
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(left, topY, colW, bandH);
-    ctx.clip();
-    ctx.strokeStyle = CHART_RANGE_STRIPE;
-    ctx.lineWidth = 1;
-    ctx.setLineDash([2, 3]);
-    const stride = 4;
-    for (let s = left - bandH; s <= left + colW + bandH; s += stride) {
-      ctx.beginPath();
-      ctx.moveTo(s, topY);
-      ctx.lineTo(s + bandH, topY + bandH);
-      ctx.stroke();
-    }
-    ctx.restore();
-    // Single range line (avoid the two vertical edges of a rectangle frame).
-    ctx.strokeStyle = CHART_RANGE;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(xFuture, topY);
-    ctx.lineTo(xFuture, topY + bandH);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    const xNow = xAtIdx(lastIdx);
-    const yNow = yAt(prices[lastIdx]);
-    const [sxLo, syLo] = lineStartAfterDot(xNow, yNow, xFuture, yLow, liveDotRadius);
-    const [sxHi, syHi] = lineStartAfterDot(xNow, yNow, xFuture, yHigh, liveDotRadius);
-    ctx.save();
-    ctx.strokeStyle = CHART_RANGE;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(sxLo, syLo);
-    ctx.lineTo(xFuture, yLow);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(sxHi, syHi);
-    ctx.lineTo(xFuture, yHigh);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    // Range endpoints: ticks + same color as range lines.
-    ctx.strokeStyle = CHART_RANGE;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([]);
-    const capLen = Math.max(6, dotSide);
-    ctx.beginPath();
-    ctx.moveTo(xFuture - capLen / 2, yLow);
-    ctx.lineTo(xFuture + capLen / 2, yLow);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(xFuture - capLen / 2, yHigh);
-    ctx.lineTo(xFuture + capLen / 2, yHigh);
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  /** Dots on each tick (round); outside the one-step band → CHART_DOT_OUTSIDE. */
-  for (let k = 0; k < n; k += 1) {
-    let inside = true;
-    if (k >= 1) {
-      const sigStep = forwardForecastSigma[k - 1];
-      const anchorStep = prices[k - 1];
-      const spot = prices[k];
-      if (sigStep !== null && sigStep > 0 && Number.isFinite(anchorStep) && Number.isFinite(spot)) {
-        const lo = anchorStep * (1 - sigStep);
-        const hi = anchorStep * (1 + sigStep);
-        const loB = Math.min(lo, hi);
-        const hiB = Math.max(lo, hi);
-        inside = spot >= loB && spot <= hiB;
-      }
-    }
-    const cx = xAtIdx(k);
-    const cy = yAt(prices[k]);
-
-    ctx.save();
-    ctx.shadowBlur = LIVE_DOT_SHADOW_BLUR;
-    ctx.shadowColor = inside ? LIVE_DOT_SHADOW_COLOR_INSIDE : LIVE_DOT_SHADOW_COLOR_OUTSIDE;
-    ctx.fillStyle = inside ? CHART_DOT : CHART_DOT_OUTSIDE;
-    ctx.beginPath();
-    ctx.arc(cx, cy, liveDotRadius, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.shadowBlur = 0;
-    ctx.lineWidth = LIVE_DOT_OUTLINE_WIDTH;
-    ctx.strokeStyle = LIVE_DOT_OUTLINE_COLOR;
-    ctx.stroke();
-    ctx.restore();
-  }
-}
-
-function drawSevenDayChart(points: DailyPoint[]) {
-  if (!canvas7d || !ctx7d) return;
-  const width = canvas7d.width;
-  const height = canvas7d.height;
-  const padTop = 22;
-  const padLeft = 14;
-  const padRight = 14;
-  const bottomPad = 48;
-
-  ctx7d.clearRect(0, 0, width, height);
-  ctx7d.fillStyle = "#0d1429";
-  ctx7d.fillRect(0, 0, width, height);
-
-  ctx7d.strokeStyle = "#253055";
-  ctx7d.lineWidth = 1;
-  for (let i = 0; i < 4; i += 1) {
-    const y = padTop + ((height - padTop - bottomPad) * i) / 3;
-    ctx7d.beginPath();
-    ctx7d.moveTo(padLeft, y);
-    ctx7d.lineTo(width - padRight, y);
-    ctx7d.stroke();
-  }
-
-  const realCloses = points.map((p) => p.close).filter((c): c is number => c !== null && Number.isFinite(c));
-
-  if (realCloses.length === 0) {
-    ctx7d.fillStyle = "#9eabc9";
-    ctx7d.font = "13px Segoe UI";
-    ctx7d.fillText("No daily data yet.", padLeft + 8, height / 2);
-    if (chart7dLowEl) chart7dLowEl.textContent = "—";
-    if (chart7dHighEl) chart7dHighEl.textContent = "—";
-    return;
-  }
-
-  let minP = Math.min(...realCloses);
-  let maxP = Math.max(...realCloses);
-
-  // Expand Y-scale so forecast ranges are visible on the same chart.
-  if (lastSavedForecasts.length > 0) {
-    const { latest, historicalMidnights } = splitForecastRows(lastSavedForecasts);
-
-    historicalMidnights.forEach((fp) => {
-      const ts = Date.parse(fp.timestamp);
-      if (!Number.isFinite(ts)) return;
-      const k = dateKeyUtc(ts);
-      const idx = points.findIndex((p) => p.close !== null && dateKeyUtc(p.open_time) === k);
-      if (idx <= 0) return;
-      const baseClose = points[idx - 1].close as number;
-      const sigma = Math.max(fp.garch_forecast, 0);
-      const low = baseClose * (1 - sigma);
-      const high = baseClose * (1 + sigma);
-      minP = Math.min(minP, low);
-      maxP = Math.max(maxP, high);
-    });
-
-    const lastRealClose = [...points].reverse().find((p) => p.close !== null)?.close ?? null;
-    if (latest && lastRealClose !== null && Number.isFinite(lastRealClose)) {
-      const sigma = Math.max(latest.garch_forecast, 0);
-      const low = lastRealClose * (1 - sigma);
-      const high = lastRealClose * (1 + sigma);
-      minP = Math.min(minP, low);
-      maxP = Math.max(maxP, high);
-    }
-  }
-
-  const padPct = 0.03;
-  const padAbs = Math.max((maxP - minP) * padPct, 0.000001);
-  minP -= padAbs;
-  maxP += padAbs;
-  const range = Math.max(maxP - minP, 0.000001);
-  const plotH = height - padTop - bottomPad;
-  const plotW = width - padLeft - padRight;
-  const lastIdx = Math.max(points.length - 1, 0);
-  const rightXGutterSteps = 0.14;
-  const xSpan = Math.max(lastIdx + rightXGutterSteps, 1e-6);
-  const xAt = (i: number) => padLeft + (plotW * i) / xSpan;
-  const yAt = (close: number) => padTop + plotH - ((close - minP) / range) * plotH;
-
-  /* Line only across real closes (stops before future slot) */
-  ctx7d.beginPath();
-  ctx7d.lineWidth = 2;
-  ctx7d.strokeStyle = CHART_PRICE_LINE;
-  let started = false;
-  points.forEach((p, i) => {
-    if (p.close === null) {
-      started = false;
-      return;
-    }
-    const x = xAt(i);
-    const y = yAt(p.close);
-    if (!started) {
-      ctx7d.moveTo(x, y);
-      started = true;
-    } else {
-      ctx7d.lineTo(x, y);
-    }
-  });
-  ctx7d.stroke();
-
-  // For days where we have a saved midnight forecast, clamp the dot onto that day's forecast range.
-  const rangeByIdx = new Map<number, { low: number; high: number }>();
-  if (lastSavedForecasts.length > 0) {
-    const { historicalMidnights } = splitForecastRows(lastSavedForecasts);
-    historicalMidnights.forEach((fp) => {
-      const ts = Date.parse(fp.timestamp);
-      if (!Number.isFinite(ts)) return;
-      const k = dateKeyUtc(ts);
-      const idx = points.findIndex((p) => p.close !== null && dateKeyUtc(p.open_time) === k);
-      if (idx <= 0) return;
-      const baseClose = points[idx - 1].close;
-      if (baseClose === null || !Number.isFinite(baseClose)) return;
-      const sigma = Math.max(fp.garch_forecast, 0);
-      const lo = baseClose * (1 - sigma);
-      const hi = baseClose * (1 + sigma);
-      rangeByIdx.set(idx, { low: Math.min(lo, hi), high: Math.max(lo, hi) });
-    });
-  }
-
-  /* Overlay saved forecasts: recent midnights on matching dates + latest range on tomorrow. */
-  if (lastSavedForecasts.length > 0) {
-    const { latest, historicalMidnights } = splitForecastRows(lastSavedForecasts);
-
-    historicalMidnights.forEach((fp) => {
-      const ts = Date.parse(fp.timestamp);
-      if (!Number.isFinite(ts)) return;
-      const k = dateKeyUtc(ts);
-      const idx = points.findIndex((p) => p.close !== null && dateKeyUtc(p.open_time) === k);
-      if (idx <= 0) return;
-      const baseClose = points[idx - 1].close as number;
-      const sigma = Math.max(fp.garch_forecast, 0);
-      const low = baseClose * (1 - sigma);
-      const high = baseClose * (1 + sigma);
-      const x = xAt(idx);
-      const yLow = yAt(low);
-      const yHigh = yAt(high);
-
-      ctx7d.save();
-      ctx7d.strokeStyle = CHART_RANGE;
-      ctx7d.lineWidth = 2;
-      ctx7d.setLineDash([4, 4]);
-      ctx7d.beginPath();
-      ctx7d.moveTo(x, yLow);
-      ctx7d.lineTo(x, yHigh);
-      ctx7d.stroke();
-      ctx7d.setLineDash([]);
-      ctx7d.fillStyle = CHART_RANGE;
-      ctx7d.beginPath();
-      ctx7d.arc(x, yLow, 3, 0, Math.PI * 2);
-      ctx7d.fill();
-      ctx7d.beginPath();
-      ctx7d.arc(x, yHigh, 3, 0, Math.PI * 2);
-      ctx7d.fill();
-      ctx7d.restore();
-    });
-
-    const futureIdx = points.findIndex((p) => p.close === null);
-    const lastRealIdx = (() => {
-      for (let i = points.length - 1; i >= 0; i -= 1) {
-        if (points[i].close !== null) return i;
-      }
-      return -1;
-    })();
-    const lastReal = lastRealIdx >= 0 ? (points[lastRealIdx].close as number) : null;
-
-    if (latest && futureIdx >= 0 && lastReal !== null && Number.isFinite(lastReal)) {
-      const sigma = Math.max(latest.garch_forecast, 0);
-      const low = lastReal * (1 - sigma);
-      const high = lastReal * (1 + sigma);
-      const x = xAt(futureIdx);
-      const yLow = yAt(low);
-      const yHigh = yAt(high);
-      const xNow = xAt(lastRealIdx);
-      const yNow = yAt(lastReal);
-      const yellowDotR = 3.5;
-      const [sxLow, syLow] = lineStartAfterDot(xNow, yNow, x, yLow, yellowDotR);
-      const [sxHigh, syHigh] = lineStartAfterDot(xNow, yNow, x, yHigh, yellowDotR);
-
-      ctx7d.save();
-      ctx7d.strokeStyle = CHART_RANGE;
-      ctx7d.lineWidth = 2;
-      ctx7d.setLineDash([4, 4]);
-      ctx7d.beginPath();
-      ctx7d.moveTo(sxLow, syLow);
-      ctx7d.lineTo(x, yLow);
-      ctx7d.stroke();
-      ctx7d.beginPath();
-      ctx7d.moveTo(sxHigh, syHigh);
-      ctx7d.lineTo(x, yHigh);
-      ctx7d.stroke();
-      ctx7d.setLineDash([]);
-      ctx7d.fillStyle = CHART_RANGE;
-      ctx7d.beginPath();
-      ctx7d.arc(x, yLow, 3, 0, Math.PI * 2);
-      ctx7d.fill();
-      ctx7d.beginPath();
-      ctx7d.arc(x, yHigh, 3, 0, Math.PI * 2);
-      ctx7d.fill();
-      ctx7d.restore();
-    }
-  }
-
-  /* Dots on real days (drawn last so ranges don't cover them) */
-  points.forEach((p, i) => {
-    if (p.close === null) return;
-    const x = xAt(i);
-    const y = yAt(p.close);
-    ctx7d.save();
-    ctx7d.shadowBlur = 10;
-    ctx7d.shadowColor = "rgba(214, 236, 255, 0.95)";
-    ctx7d.beginPath();
-    ctx7d.fillStyle = CHART_DOT_7D;
-    ctx7d.arc(x, y, 4.4, 0, Math.PI * 2);
-    ctx7d.fill();
-    ctx7d.shadowBlur = 0;
-    ctx7d.lineWidth = 2;
-    ctx7d.strokeStyle = "rgba(13, 20, 41, 0.95)";
-    ctx7d.stroke();
-    ctx7d.restore();
-  });
-
-  if (chart7dLowEl) {
-    chart7dLowEl.textContent = minP.toLocaleString(undefined, { maximumFractionDigits: 0 });
-  }
-  if (chart7dHighEl) {
-    chart7dHighEl.textContent = maxP.toLocaleString(undefined, { maximumFractionDigits: 0 });
-  }
-
-  ctx7d.fillStyle = "#9eabc9";
-  ctx7d.font = width < 420 ? "9px Segoe UI" : "10px Segoe UI";
-  points.forEach((p, i) => {
-    const x = xAt(i);
-    let label: string;
-    if (p.label) {
-      label = p.label;
-    } else {
-      const d = new Date(p.open_time);
-      // Use UTC to match Binance daily candle boundaries (00:00 UTC).
-      label = `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
-    }
-    const w = ctx7d.measureText(label).width;
-    const minX = padLeft;
-    const maxX = width - padRight - w;
-    let tx = x - w / 2;
-    if (tx < minX) tx = minX;
-    if (tx > maxX) tx = maxX;
-    ctx7d.fillText(label, tx, height - 18);
-  });
 }
 
 async function loadSevenDayPrices() {
@@ -980,14 +394,10 @@ async function loadSevenDayPrices() {
       close: Number(row[4]),
     }));
     const displayPts = dailyPointsFromApi(apiPts);
-    try {
-      lastSavedForecasts = await loadSavedForecasts();
-    } catch {
-      lastSavedForecasts = [];
-    }
+    lastSavedForecasts = await loadSavedForecasts();
     lastSevenDayDisplay = displayPts;
     layoutChart7dCanvas();
-    drawSevenDayChart(lastSevenDayDisplay);
+    drawSevenDayChart(lastSevenDayDisplay, lastSavedForecasts);
 
     try {
       const rows = await loadErrorLog(ERRORS_24H_JSON_URL);
@@ -1047,11 +457,9 @@ async function loadSevenDayPrices() {
     rest7dStatusEl.classList.remove("neutral");
     rest7dStatusEl.classList.add("buy");
   } catch (e) {
-    if (chart7dLowEl) chart7dLowEl.textContent = "—";
-    if (chart7dHighEl) chart7dHighEl.textContent = "—";
     lastSevenDayDisplay = [];
     layoutChart7dCanvas();
-    drawSevenDayChart([]);
+    drawSevenDayChart([], lastSavedForecasts);
     rest7dStatusEl.textContent = "Failed — Binance REST unavailable";
     rest7dStatusEl.classList.remove("neutral");
     rest7dStatusEl.classList.add("sell");
@@ -1061,9 +469,34 @@ async function loadSevenDayPrices() {
   }
 }
 
+function msUntilNextSevenDayReloadUtc(): number {
+  const d = new Date();
+  const elapsedInDayMs =
+    (((d.getUTCHours() * 60 + d.getUTCMinutes()) * 60 + d.getUTCSeconds()) * 1000 +
+      d.getUTCMilliseconds());
+  const hourMs = 60 * 60 * 1000;
+  for (const h of SEVEN_DAY_UTC_RELOAD_HOURS) {
+    const slotStartMs = h * hourMs;
+    if (slotStartMs > elapsedInDayMs) {
+      return slotStartMs - elapsedInDayMs;
+    }
+  }
+  return 24 * hourMs - elapsedInDayMs;
+}
+
+function scheduleSevenDayReloadsTwiceDailyUtc(): void {
+  const arm = () => {
+    setTimeout(() => {
+      void loadSevenDayPrices();
+      arm();
+    }, msUntilNextSevenDayReloadUtc());
+  };
+  arm();
+}
+
 async function loadCurrentPrice() {
   try {
-    await loadForecasts10sSigma();
+    await loadForecasts10sSigma(prices);
   } catch (e) {
     pendingForwardBand = null;
     if (liveChartPriceEl) liveChartPriceEl.textContent = "—";
@@ -1072,13 +505,11 @@ async function loadCurrentPrice() {
   }
 }
 
-drawChart();
+drawLiveForecastChart(getLiveForecastSeries);
 void loadSevenDayPrices();
+scheduleSevenDayReloadsTwiceDailyUtc();
 void loadCurrentPrice();
 void loadCusumSignals();
-setInterval(() => {
-  void loadSevenDayPrices();
-}, SEVEN_DAY_POLL_MS);
 setInterval(() => {
   void loadCurrentPrice();
 }, POLL_MS);
@@ -1091,9 +522,9 @@ window.addEventListener("resize", () => {
   if (resizeChartTimer) clearTimeout(resizeChartTimer);
   resizeChartTimer = setTimeout(() => {
     layoutPriceChartCanvas();
-    drawChart();
+    drawLiveForecastChart(getLiveForecastSeries);
     layoutChart7dCanvas();
-    drawSevenDayChart(lastSevenDayDisplay);
+    drawSevenDayChart(lastSevenDayDisplay, lastSavedForecasts);
   }, 120);
 });
 
