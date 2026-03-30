@@ -1,19 +1,55 @@
 from __future__ import annotations
 
 import contextlib
-import os
 import asyncio
 import json
 from datetime import datetime, timezone
+import os
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from typing import Any
 
-import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.storage import read_forecasts, read_latest_forecast_errors
+from src.storage import read_forecasts
 
 import websockets
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    val = raw.strip()
+    return val if val else default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    val = raw.strip().lower()
+    if val in {"1", "true", "yes", "y", "on"}:
+        return True
+    if val in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+DB_PATH = _env_str("DB_PATH", "data/forecasts.db")
+
+
+def _cors_origins() -> list[str]:
+    """
+    In production, prefer setting `API_CORS_ORIGINS` to a comma-separated allowlist.
+    If unset, we default to common local + Firebase hosting origins.
+    """
+    raw = _env_str(
+        "API_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,https://bg-crypto-sandbox.web.app,https://bg-crypto-sandbox.firebaseapp.com",
+    )
+    return [o.strip() for o in raw.split(",") if o.strip()]
 
 
 class _BinanceTradeHub:
@@ -78,7 +114,7 @@ class _BinanceTradeHub:
                                     sym = str(data.get("s", "")).strip().upper()
                                     if not sym:
                                         sym = self.stream.split("@", 1)[0].upper()
-                                    self.latest_trade = {
+                                    payload = {
                                         "type": "trade",
                                         "symbol": sym,
                                         "price": float(p_raw),
@@ -86,7 +122,9 @@ class _BinanceTradeHub:
                                             event_ms / 1000, tz=timezone.utc
                                         ).isoformat(),
                                     }
-                                    self.latest_event_ms = event_ms
+                                    async with self._guard:
+                                        self.latest_trade = payload
+                                        self.latest_event_ms = event_ms
                             except Exception:
                                 continue
                 except asyncio.CancelledError:
@@ -100,6 +138,12 @@ class _BinanceTradeHub:
             async with self._guard:
                 if self._task is runner:
                     self._task = None
+
+    async def snapshot(self) -> dict[str, Any] | None:
+        async with self._guard:
+            if self.latest_trade is None:
+                return None
+            return dict(self.latest_trade)
 
 
 _trade_hubs: dict[str, _BinanceTradeHub] = {}
@@ -116,50 +160,18 @@ async def _hub_for_stream(stream: str) -> _BinanceTradeHub:
         return hub
 
 
-def _env_str(name: str, default: str) -> str:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    val = raw.strip()
-    return val if val else default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    val = raw.strip().lower()
-    if val in {"1", "true", "yes", "y", "on"}:
-        return True
-    if val in {"0", "false", "no", "n", "off"}:
-        return False
-    return default
-
-
-DB_PATH = _env_str("DB_PATH", "data/forecasts.db")
-DEFAULT_SYMBOL = _env_str("SYMBOL", "BTC/USDT")
-DEFAULT_TIMEFRAME = _env_str("TIMEFRAME", "1h")
-
-ALLOW_CORS = _env_bool("API_ALLOW_CORS", True)
-ALLOWED_ORIGINS = [
-    o.strip()
-    for o in _env_str(
-        "API_CORS_ORIGINS",
-        "http://localhost:5173,https://bg-crypto-sandbox.web.app,https://bg-crypto-sandbox.firebaseapp.com",
-    ).split(",")
-    if o.strip()
-]
-
-app = FastAPI(title="Volatility Forecasting API", version="0.1.0")
-
-if ALLOW_CORS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+app = FastAPI(title="Volatility Forecasting API", version="0.2.0")
+_allow_all = _env_bool("API_CORS_ALLOW_ALL", False)
+_origins = ["*"] if _allow_all else _cors_origins()
+# Browsers forbid cookies/credentials when `Access-Control-Allow-Origin: *`.
+_allow_credentials = False if _origins == ["*"] else True
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=_allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
@@ -169,8 +181,9 @@ def root() -> dict[str, Any]:
         "ok": True,
         "endpoints": {
             "health": "/health",
-            "forecasts": "/forecasts?symbol=BTC/USDT&timeframe=1h",
-            "errors": "/errors?series=24h&symbol=BTC/USDT&limit=30",
+            "forecasts": "/forecasts?symbol=BTC/USDT&timeframe=5s_60s&limit=30&newest_first=true",
+            "daily_prices": "/market/daily?symbol=BTCUSDT&days=7",
+            "ws_price": "/ws/price?symbol=btcusdt&interval_ms=1000",
             "docs": "/docs",
         },
     }
@@ -183,11 +196,14 @@ def health() -> dict[str, Any]:
 
 @app.get("/forecasts")
 def get_forecasts(
-    symbol: str = Query(default=DEFAULT_SYMBOL),
-    timeframe: str = Query(default=DEFAULT_TIMEFRAME),
-    limit: int | None = Query(default=None, ge=1, le=500),
-    newest_first: bool = Query(default=False),
+    symbol: str = Query(default="BTC/USDT", description="Forecast series symbol, e.g. BTC/USDT"),
+    timeframe: str = Query(default="5s_60s", description="Forecast timeframe key, e.g. 5s_60s"),
+    limit: int | None = Query(default=120, ge=1, le=2000),
+    newest_first: bool = Query(default=True),
 ) -> dict[str, Any]:
+    """
+    Reads forecast rows from the local SQLite DB and returns the JSON shape the frontend expects.
+    """
     try:
         df = read_forecasts(
             db_path=DB_PATH,
@@ -199,95 +215,113 @@ def get_forecasts(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"DB read failed: {exc}")
 
-    payload: dict[str, Any] = {
+    out: list[dict[str, Any]] = []
+    if not df.empty:
+        # `read_forecasts` already returns `timestamp` as ISO string from SQLite.
+        for _, row in df.iterrows():
+            ts = row.get("timestamp")
+            val = row.get("garch_forecast")
+            if ts is None or val is None:
+                continue
+            try:
+                out.append({"timestamp": str(ts), "garch_forecast": float(val)})
+            except Exception:
+                continue
+
+    return {
         "symbol": symbol,
         "timeframe": timeframe,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "forecasts": [],
+        "forecasts": out,
     }
-    if df.empty:
-        return payload
-
-    out = []
-    for _, row in df.iterrows():
-        ts = pd.to_datetime(row["timestamp"], utc=True, errors="coerce")
-        val = row["garch_forecast"]
-        if pd.isna(ts) or pd.isna(val):
-            continue
-        out.append({"timestamp": ts.isoformat(), "garch_forecast": float(val)})
-    payload["forecasts"] = out
-    return payload
 
 
-@app.get("/errors")
-def get_errors(
-    series: str = Query(description="Error series name, e.g. '10s' or '24h'"),
-    symbol: str = Query(default=DEFAULT_SYMBOL),
-    limit: int = Query(default=30, ge=1, le=500),
+def _fetch_binance_klines(*, symbol: str, interval: str, limit: int) -> list[list[Any]]:
+    base = "https://api.binance.com/api/v3/klines"
+    qs = urlencode({"symbol": symbol.upper(), "interval": interval, "limit": int(limit)})
+    req = Request(f"{base}?{qs}", headers={"User-Agent": "vol-forecast-api/0.2"})
+    with urlopen(req, timeout=15) as resp:
+        raw = resp.read().decode("utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise ValueError("Unexpected Binance response shape")
+    return data
+
+
+@app.get("/market/daily")
+async def get_daily_prices(
+    symbol: str = Query(default="BTCUSDT", description="Binance symbol, e.g. BTCUSDT"),
+    days: int = Query(default=7, ge=1, le=60),
 ) -> dict[str, Any]:
+    """
+    Returns the last N daily candles (1d) and daily closes.
+    Intended for the "last 7 days" graph.
+    """
     try:
-        df = read_latest_forecast_errors(
-            db_path=DB_PATH, symbol=symbol, series=series, limit=limit
-        )
+        klines = await asyncio.to_thread(_fetch_binance_klines, symbol=symbol, interval="1d", limit=days)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"DB read failed: {exc}")
+        raise HTTPException(status_code=502, detail=f"Binance fetch failed: {exc}")
 
-    payload: dict[str, Any] = {
-        "symbol": symbol,
-        "series": series,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "errors": [],
-    }
-    if df.empty:
-        return payload
-
-    out = []
-    for _, row in df.iterrows():
-        t = pd.to_datetime(row["event_time"], utc=True, errors="coerce")
+    out: list[dict[str, Any]] = []
+    for k in klines:
+        if not isinstance(k, list) or len(k) < 7:
+            continue
+        open_time_ms = int(k[0])
+        close_price = float(k[4])
+        close_time_ms = int(k[6])
         out.append(
             {
-                "event_time": None if pd.isna(t) else t.isoformat(),
-                "outside_frac": None
-                if pd.isna(row["outside_frac"])
-                else float(row["outside_frac"]),
-                "side": None if pd.isna(row["side"]) else str(row["side"]),
+                "open_time": datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc).isoformat(),
+                "close_time": datetime.fromtimestamp(close_time_ms / 1000, tz=timezone.utc).isoformat(),
+                "close": close_price,
             }
         )
-    payload["errors"] = out
-    return payload
+
+    return {
+        "symbol": symbol.upper(),
+        "interval": "1d",
+        "days": days,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "candles": out,
+    }
 
 
 @app.websocket("/ws/price")
 async def ws_price(
     ws: WebSocket,
     symbol: str = Query(default="btcusdt", description="Binance symbol, lowercase (e.g. btcusdt)"),
-    min_interval_ms: int = Query(default=500, ge=100, le=10_000),
+    interval_ms: int = Query(default=1000, ge=250, le=10_000),
 ) -> None:
     stream = f"{symbol.lower()}@trade"
     hub = await _hub_for_stream(stream)
     await hub.acquire()
-    interval_s = float(min_interval_ms) / 1000.0
+    interval_s = float(interval_ms) / 1000.0
     loop = asyncio.get_running_loop()
     next_emit = loop.time() + interval_s
-    last_sent_event_ms: int | None = None
     try:
         await ws.accept()
         await ws.send_json(
             {"type": "status", "status": "connected", "source": "binance", "stream": stream}
         )
+        # Send an immediate snapshot (if we already have one) so the UI doesn't wait a full interval.
+        payload0 = await hub.snapshot()
+        if payload0 is not None:
+            out0 = dict(payload0)
+            out0["symbol"] = symbol.upper()
+            out0["server_time"] = datetime.now(timezone.utc).isoformat()
+            await ws.send_json(out0)
         while True:
             timeout_s = max(0.0, next_emit - loop.time())
             await asyncio.sleep(timeout_s)
 
             now = loop.time()
             if now >= next_emit:
-                payload = hub.latest_trade
-                ev = hub.latest_event_ms
-                if payload is not None and ev is not None and ev != last_sent_event_ms:
+                payload = await hub.snapshot()
+                if payload is not None:
                     out = dict(payload)
                     out["symbol"] = symbol.upper()
+                    out["server_time"] = datetime.now(timezone.utc).isoformat()
                     await ws.send_json(out)
-                    last_sent_event_ms = ev
                 while next_emit <= now:
                     next_emit += interval_s
     except WebSocketDisconnect:

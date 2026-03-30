@@ -130,6 +130,9 @@ h1 {
   border-radius: 12px;
   padding: 12px 14px;
   margin-bottom: 16px;
+  /* Prevent ApexCharts inner nodes from forcing overflow in flex/grid layouts. */
+  min-width: 0;
+  overflow: hidden;
 }
 
 .chart-panel-secondary h2 {
@@ -175,25 +178,45 @@ h1 {
 #price-chart {
   width: 100%;
   max-width: 100%;
-  height: auto;
-  min-height: 300px;
+  /* The HTML sets an explicit height; keep the chart constrained to it. */
+  height: 320px;
+  min-height: 0;
   display: block;
   background: #0d1429;
   border: 1px solid #253055;
   border-radius: 10px;
   box-sizing: border-box;
+  overflow: hidden;
+  position: relative;
 }
 
 #chart-7d {
   width: 100%;
   max-width: 100%;
-  height: auto;
-  min-height: 300px;
+  height: 320px;
+  min-height: 0;
   display: block;
   background: #0d1429;
   border: 1px solid #253055;
   border-radius: 10px;
   box-sizing: border-box;
+  overflow: hidden;
+  position: relative;
+}
+
+/* ApexCharts can inject fixed-width SVG/canvas; force it to fit its parent box. */
+#price-chart .apexcharts-canvas,
+#chart-7d .apexcharts-canvas {
+  width: 100% !important;
+  max-width: 100% !important;
+  height: 100% !important;
+}
+
+#price-chart .apexcharts-svg,
+#chart-7d .apexcharts-svg {
+  width: 100% !important;
+  max-width: 100% !important;
+  height: 100% !important;
 }
 
 .chart-legend {
@@ -305,9 +328,46 @@ h1 {
   margin-bottom: 10px;
 }
 
+.panel-title-row--tight {
+  margin-top: 10px;
+}
+
 h2 {
   margin: 0;
   font-size: 1rem;
+}
+
+.panel-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.select-label {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}
+
+.select-input {
+  background: rgba(17, 23, 43, 0.85);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 0.88rem;
+  outline: none;
+  min-width: 190px;
+}
+
+.select-input:focus {
+  border-color: rgba(110, 168, 254, 0.75);
+  box-shadow: 0 0 0 3px rgba(110, 168, 254, 0.18);
+}
+
+.is-hidden {
+  display: none !important;
 }
 
 .panel-subtitle {

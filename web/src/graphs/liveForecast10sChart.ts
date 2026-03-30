@@ -1,11 +1,13 @@
 /**
- * Short-horizon GARCH live price chart (WS ticks + polled σ): canvas, tunnels, purple head, trail.
- * API timeframe is LIVE_FORECAST_TIMEFRAME (short-horizon live σ).
+ * Short-horizon GARCH live price chart (WS ticks + polled σ), rendered with ApexCharts.
+ * This module intentionally keeps the same exported function names that `app.ts` calls.
  */
 
+import ApexCharts from "apexcharts";
+
 export const MAX_POINTS = 10;
-/** API bar label; must match `TEN_SEC_DB_TIMEFRAME` / DB rows (default 10s). */
-export const LIVE_FORECAST_TIMEFRAME = "10s";
+/** API bar label; must match the DB timeframe that `main.py` writes for the live band. */
+export const LIVE_FORECAST_TIMEFRAME = "5s_60s";
 
 export type SavedForecast = { timestamp: string; garch_forecast: number };
 
@@ -13,82 +15,20 @@ const API_BASE =
   (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_BASE ??
   "http://127.0.0.1:8000";
 const BINANCE_PAIR = "BTC/USDT";
-const LIVE_FORECAST_JSON_URL = `${API_BASE}/forecasts?symbol=${encodeURIComponent(BINANCE_PAIR)}&timeframe=${encodeURIComponent(LIVE_FORECAST_TIMEFRAME)}&newest_first=true&limit=6`;
+const LIVE_FORECAST_JSON_URL = `${API_BASE}/forecasts?symbol=${encodeURIComponent(BINANCE_PAIR)}&timeframe=${encodeURIComponent(LIVE_FORECAST_TIMEFRAME)}&newest_first=true&limit=30`;
 
-const MAIN_CHART_HEIGHT = 320;
-
-const CHART_RANGE = "#FFFFFF";
-const CHART_PRICE_LINE = "#5E97F6";
-const CHART_DOT_OUTSIDE = "#FF5252";
-
-const LIVE_DOT_SHADOW_BLUR = 14;
-const LIVE_DOT_OUTLINE_COLOR = "rgba(13, 20, 41, 0.96)";
-const LIVE_DOT_OUTLINE_WIDTH = 2;
-const LIVE_TIP_DOT_RADIUS = 4.5;
-const LIVE_LINE_GLOW_BLUR = 44;
-const LIVE_LINE_GLOW_COLOR_OK = "rgba(120, 178, 255, 1)";
-const LIVE_LINE_GLOW_COLOR_BAD = "rgba(255, 120, 120, 1)";
-const LIVE_LINE_OUTLINE_WIDTH = 5;
-const LIVE_TRAIL_STROKE_WIDTH = 2.75;
-const LIVE_PURPLE_PATH_STEPS_FROM_END = 5;
-const LIVE_NEWEST_X_FRAC = 0.5;
-const LIVE_X_SPAN_FRAC = 0.9;
-const LIVE_PURPLE_SEG_MS = 1200;
-
-const liveRangeEl = document.getElementById("live-range");
 const marketEl = document.getElementById("market-value");
-const canvas = document.getElementById("price-chart") as HTMLCanvasElement | null;
-const ctx = canvas?.getContext("2d") ?? null;
-
-let livePurpleAnimRaf = 0;
-let livePurpleFloatIdx = 0;
-let livePurpleLastPerfMs = 0;
 
 export let latest10sGarchSigma: number | null = null;
 export let latest10sGarchSigmaUpdatedAtMs = 0;
-let latest10sForecastKey: string | null = null;
-let pendingTunnelKey: string | null = null;
-let pendingTunnelSigma: number | null = null;
-let activeTunnelKey: string | null = null;
-let activeTunnelSigma: number | null = null;
-let activeTunnelAnchorPrice: number | null = null;
-let activeTunnelStartIdx: number | null = null;
 
-type TunnelBand = {
-  key: string;
-  sigma: number;
-  anchorPrice: number;
-  startIdx: number;
-  endIdx: number;
-};
-const tunnelBands: TunnelBand[] = [];
-let liveYViewMin: number | null = null;
-let liveYViewMax: number | null = null;
-
-export function refreshLiveForecastRangeLabel(prices: number[]) {
-  if (!liveRangeEl) return;
-  const s = latest10sGarchSigma;
-  const n = prices.length;
-  const anchor = n >= 2 ? prices[n - 2] : null;
-  if (
-    typeof s === "number" &&
-    Number.isFinite(s) &&
-    s > 0 &&
-    typeof anchor === "number" &&
-    Number.isFinite(anchor)
-  ) {
-    const fmt = (x: number) => x.toLocaleString(undefined, { maximumFractionDigits: 2 });
-    const low = anchor * (1 - s);
-    const high = anchor * (1 + s);
-    liveRangeEl.textContent = `range: ${fmt(low)} – ${fmt(high)}`;
-  } else {
-    liveRangeEl.textContent = "—";
-  }
+export function refreshLiveForecastRangeLabel(_prices: number[]) {
+  // The current HTML doesn’t include a `#live-range` element; keep function for compatibility.
 }
 
 export async function loadForecasts10sSigma(prices: number[]): Promise<void> {
   const now = Date.now();
-  const tryUrls = [LIVE_FORECAST_JSON_URL, "/forecasts_10s.json"];
+  const tryUrls = [LIVE_FORECAST_JSON_URL, "/forecasts_60s.json"];
   let rows: SavedForecast[] | null = null;
   for (const url of tryUrls) {
     try {
@@ -107,18 +47,11 @@ export async function loadForecasts10sSigma(prices: number[]): Promise<void> {
   if (!rows || rows.length === 0) {
     latest10sGarchSigma = null;
     latest10sGarchSigmaUpdatedAtMs = now;
-    latest10sForecastKey = null;
   } else {
     const top = rows[0];
     const s = top?.garch_forecast;
     latest10sGarchSigma = typeof s === "number" && Number.isFinite(s) ? Math.max(s, 0) : null;
     latest10sGarchSigmaUpdatedAtMs = now;
-    const ts = typeof top?.timestamp === "string" ? top.timestamp : "na";
-    const sig =
-      latest10sGarchSigma !== null && latest10sGarchSigma > 0
-        ? String(Math.round(latest10sGarchSigma * 1e8) / 1e8)
-        : "none";
-    latest10sForecastKey = `${ts}|${sig}`;
   }
 
   if (marketEl) {
@@ -127,97 +60,29 @@ export async function loadForecasts10sSigma(prices: number[]): Promise<void> {
       typeof s === "number" && Number.isFinite(s) && s > 0 ? `${(s * 100).toFixed(4)}%` : "—";
   }
 
-  if (
-    latest10sForecastKey &&
-    latest10sForecastKey !== activeTunnelKey &&
-    typeof latest10sGarchSigma === "number" &&
-    Number.isFinite(latest10sGarchSigma) &&
-    latest10sGarchSigma > 0
-  ) {
-    pendingTunnelKey = latest10sForecastKey;
-    pendingTunnelSigma = latest10sGarchSigma;
-  }
-
   refreshLiveForecastRangeLabel(prices);
 }
 
 /** After dropping the oldest price slot when length > MAX_POINTS. */
 export function shiftLiveChartAfterRingBufferPop() {
-  if (activeTunnelStartIdx !== null) {
-    activeTunnelStartIdx = Math.max(activeTunnelStartIdx - 1, 0);
-  }
-  for (const b of tunnelBands) {
-    b.startIdx -= 1;
-    b.endIdx -= 1;
-  }
-  for (let i = tunnelBands.length - 1; i >= 0; i -= 1) {
-    if (tunnelBands[i].endIdx < 0) tunnelBands.splice(i, 1);
-  }
-  livePurpleFloatIdx = Math.max(0, livePurpleFloatIdx - 1);
+  // No internal ring buffer state in ApexCharts; keep for compatibility.
 }
 
 /**
- * Run on each new spot after arrays updated; mirrors prior `handleNewSpotPrice` tail order
- * (call after draw if you need identical frame ordering — see app handler).
+ * Kept for compatibility with the previous “tunnel” renderer; ApexCharts version doesn’t animate tunnels.
+ * (App code can still call this safely.)
  */
-export function tryActivatePendingTunnel(prices: number[]) {
-  if (!pendingTunnelKey || pendingTunnelKey === activeTunnelKey) return;
-  const sigma = pendingTunnelSigma;
-  const n = prices.length;
-  const anchor = n >= 2 ? prices[n - 2] : null;
-  if (
-    typeof sigma === "number" &&
-    Number.isFinite(sigma) &&
-    sigma > 0 &&
-    typeof anchor === "number" &&
-    Number.isFinite(anchor)
-  ) {
-    if (
-      activeTunnelKey &&
-      activeTunnelSigma !== null &&
-      Number.isFinite(activeTunnelSigma) &&
-      activeTunnelSigma > 0 &&
-      activeTunnelAnchorPrice !== null &&
-      Number.isFinite(activeTunnelAnchorPrice) &&
-      activeTunnelStartIdx !== null
-    ) {
-      tunnelBands.push({
-        key: activeTunnelKey,
-        sigma: activeTunnelSigma,
-        anchorPrice: activeTunnelAnchorPrice,
-        startIdx: activeTunnelStartIdx,
-        endIdx: Math.max(n - 2, activeTunnelStartIdx),
-      });
-    }
-    activeTunnelKey = pendingTunnelKey;
-    activeTunnelSigma = sigma;
-    activeTunnelAnchorPrice = anchor;
-    activeTunnelStartIdx = n - 2;
-  } else {
-    activeTunnelKey = pendingTunnelKey;
-    activeTunnelSigma = null;
-    activeTunnelAnchorPrice = null;
-    activeTunnelStartIdx = null;
-  }
-  pendingTunnelKey = null;
-  pendingTunnelSigma = null;
+export function tryActivatePendingTunnel(_prices: number[]) {
+  // no-op
 }
 
 export function layoutPriceChartCanvas() {
-  if (!canvas) return;
-  const panel = canvas.closest(".chart-panel");
-  const raw = panel ? panel.clientWidth - 8 : canvas.clientWidth || 720;
-  const w = Math.max(260, Math.min(Math.floor(raw), 1600));
-  canvas.width = w;
-  canvas.height = MAIN_CHART_HEIGHT;
+  // ApexCharts handles responsive layout; this is kept for call sites.
 }
 
-export function liveRangeColW(canvasWidth: number, nPoints: number): number {
-  const pad = 20;
-  return Math.max(
-    2,
-    Math.min(4, ((canvasWidth - pad * 2) / Math.max(nPoints * 5, 14)) * 0.55),
-  );
+export function liveRangeColW(_canvasWidth: number, _nPoints: number): number {
+  // Previously used for canvas band width; irrelevant for ApexCharts.
+  return 3;
 }
 
 export type LiveForecastSeries = {
@@ -234,530 +99,434 @@ export type LiveForecastSeries = {
   } | null;
 };
 
-export function drawLiveForecastChart(getSeries: () => LiveForecastSeries) {
-  layoutPriceChartCanvas();
-  if (!canvas || !ctx) return;
-  const series = getSeries();
-  const { prices, forwardForecastSigma, forwardForecastLow, forwardForecastHigh, pendingForwardBand } =
-    series;
-  const width = canvas.width;
-  const height = canvas.height;
-  const pad = 20;
+let liveChart: ApexCharts | null = null;
+let liveChartEl: HTMLElement | null = null;
+let liveChartReady = false;
+let liveYViewMin: number | null = null;
+let liveYViewMax: number | null = null;
+let liveXCounter = 0;
+let lastSeenSpot: number | null = null;
 
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#0d1429";
-  ctx.fillRect(0, 0, width, height);
+// “Camera follow” + smooth tip animation (line only)
+let latestInputSeries: LiveForecastSeries | null = null;
+type BandSeg = { x0: number; x1: number; lo: number; hi: number };
+let bandSegs: BandSeg[] = [];
+let cachedBand: { x: number; y: [number, number] }[] = [];
+let lastBandKey: string | null = null;
+let bandStartX: number | null = null;
+const BAND_FUTURE_SECONDS = 50;
+let activeBandLo: number | null = null;
+let activeBandHi: number | null = null;
 
-  if (prices.length < 2) {
-    liveYViewMin = null;
-    liveYViewMax = null;
-    if (livePurpleAnimRaf) {
-      cancelAnimationFrame(livePurpleAnimRaf);
-      livePurpleAnimRaf = 0;
-    }
-    livePurpleFloatIdx = 0;
-    livePurpleLastPerfMs = 0;
-    ctx.fillStyle = "#9eabc9";
-    ctx.font = "13px Segoe UI";
-    ctx.fillText("Waiting for Binance REST data...", 24, height / 2);
+let tipStartPrice: number | null = null;
+let tipTargetPrice: number | null = null;
+let tipAnimStartMs = 0;
+const TIP_ANIM_MS = 6200;
+// Crawl: keep newest point off-screen by this many x-steps.
+const TIP_X_LAG_STEPS = 1;
+
+let camXMin: number | null = null;
+let camXMax: number | null = null;
+let camYMin: number | null = null;
+let camYMax: number | null = null;
+const CAM_LAG = 0.16; // 0..1 (higher = snappier, lower = more lag)
+
+let rafId = 0;
+
+function formatYLabel2(v: unknown): string {
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n)) return "";
+  return n.toFixed(2);
+}
+
+function ensureLiveChart(): ApexCharts | null {
+  if (liveChart && liveChartEl && document.body.contains(liveChartEl)) return liveChart;
+  liveChartReady = false;
+  liveChart?.destroy();
+  liveChart = null;
+  liveYViewMin = null;
+  liveYViewMax = null;
+  liveXCounter = 0;
+  lastSeenSpot = null;
+  latestInputSeries = null;
+  bandSegs = [];
+  cachedBand = [];
+  lastBandKey = null;
+  bandStartX = null;
+  activeBandLo = null;
+  activeBandHi = null;
+  tipStartPrice = null;
+  tipTargetPrice = null;
+  tipAnimStartMs = 0;
+  camXMin = null;
+  camXMax = null;
+  camYMin = null;
+  camYMax = null;
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = 0;
+
+  const el = document.getElementById("price-chart");
+  if (!el) return null;
+  liveChartEl = el;
+
+  const options: ApexCharts.ApexOptions = {
+    chart: {
+      type: "line",
+      height: "100%",
+      animations: {
+        enabled: false,
+      },
+      background: "#0d1429",
+      toolbar: { show: false },
+      zoom: { enabled: false },
+      foreColor: "#9eabc9",
+    },
+    grid: {
+      borderColor: "#253055",
+      strokeDashArray: 0,
+      padding: { left: 8, right: 8, top: 6, bottom: 0 },
+    },
+    legend: { show: false },
+    dataLabels: { enabled: false },
+    stroke: { curve: "smooth", width: [2, 2, 2] },
+    fill: {
+      type: ["solid", "solid", "solid"],
+      opacity: [1, 1, 0.18],
+    },
+    markers: { size: 0 },
+    xaxis: {
+      type: "numeric",
+      labels: { show: false },
+      axisBorder: { show: false },
+      axisTicks: { show: false },
+      tooltip: { enabled: false },
+    },
+    yaxis: {
+      decimalsInFloat: 2,
+      labels: {
+        formatter: formatYLabel2,
+      },
+    },
+    tooltip: { theme: "dark" },
+    series: [
+      { name: "Spot (in range)", type: "line", data: [] },
+      { name: "Spot (out of range)", type: "line", data: [] },
+      { name: "Forecast band", type: "rangeArea", data: [] },
+    ],
+    colors: ["#5E97F6", "#ff4d4f", "#FFFFFF"],
+  };
+
+  liveChart = new ApexCharts(el, options);
+  void liveChart.render().then(() => {
+    liveChartReady = true;
+    if (!rafId) rafId = requestAnimationFrame(tickRaf);
+  });
+
+  return liveChart;
+}
+
+function safeMinMax(xs: number[]): { min: number; max: number } | null {
+  const vals = xs.filter((x) => Number.isFinite(x));
+  if (vals.length === 0) return null;
+  return { min: Math.min(...vals), max: Math.max(...vals) };
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function smoothStep(t: number): number {
+  // 0..1 -> eased 0..1
+  const x = Math.max(0, Math.min(1, t));
+  return x * x * (3 - 2 * x);
+}
+
+function bandKeyFrom(series: LiveForecastSeries): string {
+  // Key the band ONLY off forecast refreshes (σ poll), not on every new price tick.
+  // This keeps the range visually anchored until a new forecast arrives.
+  // Additionally, force a recenter/recompute once per 60 seconds.
+  const minuteBucket = Math.floor(Date.now() / 60_000);
+  const pending = series.pendingForwardBand;
+  const pLow = pending?.low ?? NaN;
+  const pHigh = pending?.high ?? NaN;
+  const pSigma = pending?.sigma ?? NaN;
+  const pAnchor = pending?.anchorPrice ?? NaN;
+  return `${minuteBucket}|${Math.round(pAnchor * 100) / 100}|${Math.round(pSigma * 1e10) / 1e10}|${Math.round(pLow * 100) / 100}|${Math.round(pHigh * 100) / 100}`;
+}
+
+function tickRaf(nowMs: number) {
+  rafId = 0;
+  const chart = liveChart;
+  if (!chart || !liveChartReady) {
+    rafId = requestAnimationFrame(tickRaf);
+    return;
+  }
+  const series = latestInputSeries;
+  if (!series || series.prices.length === 0) {
+    rafId = requestAnimationFrame(tickRaf);
     return;
   }
 
-  let minP = Math.min(...prices);
-  let maxP = Math.max(...prices);
-  const nPre = prices.length;
-  for (let i = 0; i < nPre - 1; i += 1) {
-    const sig = forwardForecastSigma[i];
-    if (sig === null || sig <= 0) continue;
-    const anchor = prices[i];
-    if (!Number.isFinite(anchor)) continue;
-    minP = Math.min(minP, anchor * (1 - sig), anchor * (1 + sig));
-    maxP = Math.max(maxP, anchor * (1 - sig), anchor * (1 + sig));
-  }
-  if (pendingForwardBand !== null && pendingForwardBand.sigma > 0) {
-    const a = pendingForwardBand.anchorPrice;
-    const s = pendingForwardBand.sigma;
-    if (Number.isFinite(a)) {
-      minP = Math.min(minP, a * (1 - s), a * (1 + s));
-      maxP = Math.max(maxP, a * (1 - s), a * (1 + s));
-    }
+  const { prices } = series;
+  const newest = prices[prices.length - 1];
+  if (!Number.isFinite(newest)) {
+    rafId = requestAnimationFrame(tickRaf);
+    return;
   }
 
-  for (const b of tunnelBands) {
-    const a = b.anchorPrice;
-    const s = b.sigma;
-    if (!Number.isFinite(a) || !Number.isFinite(s) || s <= 0) continue;
-    minP = Math.min(minP, a * (1 - s), a * (1 + s));
-    maxP = Math.max(maxP, a * (1 - s), a * (1 + s));
+  // Monotonic x counter advances only when the *actual* newest changes.
+  if (lastSeenSpot === null || newest !== lastSeenSpot) {
+    liveXCounter += 1;
+    lastSeenSpot = newest;
   }
-  if (
-    activeTunnelAnchorPrice !== null &&
-    activeTunnelSigma !== null &&
-    Number.isFinite(activeTunnelAnchorPrice) &&
-    Number.isFinite(activeTunnelSigma) &&
-    activeTunnelSigma > 0
-  ) {
-    const a = activeTunnelAnchorPrice;
-    const s = activeTunnelSigma;
-    minP = Math.min(minP, a * (1 - s), a * (1 + s));
-    maxP = Math.max(maxP, a * (1 - s), a * (1 + s));
-  }
-  const padPct = 0.02;
-  const padAbs = Math.max((maxP - minP) * padPct, 0.000001);
-  minP -= padAbs;
-  maxP += padAbs;
-  if (liveYViewMin === null || liveYViewMax === null) {
-    liveYViewMin = minP;
-    liveYViewMax = maxP;
-  } else {
-    liveYViewMin = Math.min(liveYViewMin, minP);
-    liveYViewMax = Math.max(liveYViewMax, maxP);
-  }
-  minP = liveYViewMin;
-  maxP = liveYViewMax;
-  const range = Math.max(maxP - minP, 0.000001);
-  const plotH = height - pad * 2;
-  const yAt = (p: number) => height - pad - ((p - minP) / range) * plotH;
+  const xAtIdx = (i: number) => liveXCounter - (prices.length - 1 - i);
+  const xHidden = xAtIdx(prices.length - 1);
+  const xPrev = prices.length >= 2 ? xAtIdx(prices.length - 2) : xHidden;
 
-  const n = prices.length;
-  const lastIdx = n - 1;
-  const purplePathStartIdx = Math.max(0, n - LIVE_PURPLE_PATH_STEPS_FROM_END);
-  const purplePathSpan = lastIdx - purplePathStartIdx;
-  const plotInnerW = width - pad * 2;
-  const stepPx = (plotInnerW * LIVE_X_SPAN_FRAC) / Math.max(MAX_POINTS - 1, 1);
-  const centerSlotX = pad + plotInnerW * LIVE_NEWEST_X_FRAC;
+  // Animate only the tip price AND its x-position, crawling from prev -> hidden.
+  let crawlT = 1;
+  if (tipStartPrice !== null && tipTargetPrice !== null && tipAnimStartMs > 0) {
+    crawlT = (nowMs - tipAnimStartMs) / TIP_ANIM_MS;
+  }
+  const t01 = smoothStep(Math.max(0, Math.min(1, crawlT)));
+  const tip = prices.length >= 2 ? lerp(prices[prices.length - 2], newest, t01) : newest;
+  const tipX = prices.length >= 2 ? lerp(xPrev, xHidden, t01) : xHidden;
 
-  const nowP = performance.now();
-  if (lastIdx > 0 && purplePathSpan > 0) {
-    if (livePurpleLastPerfMs > 0) {
-      livePurpleFloatIdx += (nowP - livePurpleLastPerfMs) / LIVE_PURPLE_SEG_MS;
-      while (livePurpleFloatIdx > lastIdx) {
-        livePurpleFloatIdx = purplePathStartIdx + (livePurpleFloatIdx - lastIdx);
+  // Build spot series: hide the newest real point; replace with crawling synthetic tip.
+  // Then split into 2 series: blue (inside band) and red (outside band).
+  const spot: { x: number; y: number }[] = [];
+  const lastVisibleIdx = Math.max(0, prices.length - 2);
+  for (let i = 0; i <= lastVisibleIdx; i += 1) {
+    spot.push({ x: xAtIdx(i), y: prices[i] });
+  }
+  // Only add a crawling point if we have at least 2 points.
+  if (prices.length >= 2) {
+    spot.push({ x: tipX, y: tip });
+  }
+
+  const bandLo = activeBandLo;
+  const bandHi = activeBandHi;
+  const bandEndX = bandStartX !== null ? bandStartX + BAND_FUTURE_SECONDS : null;
+
+  const inRangeSeries: { x: number; y: number | null }[] = [];
+  const outRangeSeries: { x: number; y: number | null }[] = [];
+
+  const canClassify =
+    bandStartX !== null &&
+    bandEndX !== null &&
+    bandLo !== null &&
+    bandHi !== null &&
+    Number.isFinite(bandLo) &&
+    Number.isFinite(bandHi);
+  const lo = canClassify ? Math.min(bandLo as number, bandHi as number) : null;
+  const hi = canClassify ? Math.max(bandLo as number, bandHi as number) : null;
+
+  const isInsideAt = (x: number, y: number): boolean => {
+    if (!canClassify || lo === null || hi === null) return true;
+    // Only colorize within the band’s forward window; outside that, keep blue.
+    if (x < (bandStartX as number) || x > (bandEndX as number)) return true;
+    return y >= lo && y <= hi;
+  };
+
+  // Build two series with "gaps" (nulls), but duplicate the boundary point on transitions
+  // so the stroke doesn’t look like it got deleted.
+  // IMPORTANT: we compute the *crossing point* on the band edge, so red starts only
+  // after crossing the limit (no red inside the band).
+  let prevInside: boolean | null = null;
+  let prevPoint: { x: number; y: number } | null = null;
+  for (const p of spot) {
+    const inside = isInsideAt(p.x, p.y);
+    if (prevInside !== null && prevPoint !== null && inside !== prevInside) {
+      // Glue with a computed crossing point on the band edge (lo/hi).
+      // If we can’t compute it robustly, fall back to the previous point.
+      const dx = p.x - prevPoint.x;
+      const dy = p.y - prevPoint.y;
+      let crossX = prevPoint.x;
+      let crossY = prevPoint.y;
+
+      if (canClassify && lo !== null && hi !== null && Number.isFinite(dy) && Math.abs(dy) > 1e-12) {
+        const prevY = prevPoint.y;
+        const currY = p.y;
+        // Pick which boundary we crossed: high if moving above, low if moving below.
+        const boundary =
+          currY > hi || prevY > hi
+            ? hi
+            : currY < lo || prevY < lo
+              ? lo
+              : currY >= prevY
+                ? hi
+                : lo;
+        const t = (boundary - prevY) / (currY - prevY); // can be outside [0,1] if noisy; clamp
+        const t01 = Math.max(0, Math.min(1, t));
+        crossX = prevPoint.x + dx * t01;
+        crossY = boundary;
+      }
+
+      if (inside) {
+        // outside -> inside: red ends at boundary, blue starts at boundary
+        outRangeSeries.push({ x: crossX, y: crossY });
+        inRangeSeries.push({ x: crossX, y: crossY });
+      } else {
+        // inside -> outside: blue ends at boundary, red starts at boundary
+        inRangeSeries.push({ x: crossX, y: crossY });
+        outRangeSeries.push({ x: crossX, y: crossY });
       }
     }
-    livePurpleLastPerfMs = nowP;
-    if (!Number.isFinite(livePurpleFloatIdx) || livePurpleFloatIdx < purplePathStartIdx) {
-      livePurpleFloatIdx = purplePathStartIdx;
-    }
-  } else if (lastIdx > 0) {
-    livePurpleLastPerfMs = nowP;
-    livePurpleFloatIdx = purplePathStartIdx;
-  } else {
-    livePurpleLastPerfMs = nowP;
+
+    inRangeSeries.push({ x: p.x, y: inside ? p.y : null });
+    outRangeSeries.push({ x: p.x, y: inside ? null : p.y });
+    prevInside = inside;
+    prevPoint = p;
   }
 
-  const xAtIdx = (idx: number) => centerSlotX + (idx - livePurpleFloatIdx) * stepPx;
-  const xAtFloat = (u: number) => centerSlotX + (u - livePurpleFloatIdx) * stepPx;
+  // Camera follow: keep the hidden newest off-screen by TIP_X_LAG_STEPS.
+  // The window max follows the crawling point, not the hidden one.
+  const windowW = MAX_POINTS + 2;
+  const halfW = windowW / 2;
+  // Center the tip horizontally.
+  let targetXMin = tipX - halfW;
+  let targetXMax = tipX + halfW;
+  // Clamp at 0 so early startup doesn't go negative.
+  if (targetXMin < 0) {
+    targetXMax -= targetXMin;
+    targetXMin = 0;
+  }
+  camXMin = camXMin === null ? targetXMin : lerp(camXMin, targetXMin, CAM_LAG);
+  camXMax = camXMax === null ? targetXMax : lerp(camXMax, targetXMax, CAM_LAG);
 
-  let purpleYRaw: number;
-  if (lastIdx <= 0) {
-    purpleYRaw = yAt(prices[0]);
-  } else {
-    const i0 = Math.min(Math.max(0, Math.floor(livePurpleFloatIdx)), lastIdx - 1);
-    const localT = livePurpleFloatIdx - i0;
-    const i1 = i0 + 1;
-    const p0 = prices[i0];
-    const p1 = prices[i1];
-    if (!Number.isFinite(p0) || !Number.isFinite(p1)) {
-      purpleYRaw = yAt(prices[0]);
+  // Y camera: center around tip, span based on latest band width (or recent range).
+  const bandYs: number[] = [];
+  for (const b of cachedBand) bandYs.push(b.y[0], b.y[1]);
+  const mmBand = safeMinMax(bandYs);
+  const mmSpot = safeMinMax(prices);
+  let span = 1.0;
+  if (mmBand) span = Math.max(span, (mmBand.max - mmBand.min) * 0.7);
+  if (mmSpot) span = Math.max(span, (mmSpot.max - mmSpot.min) * 0.9);
+  span = Math.max(span, Math.max(Math.abs(tip) * 0.0025, 10)); // avoid tiny/flat view
+  const targetYMin = tip - span;
+  const targetYMax = tip + span;
+  camYMin = camYMin === null ? targetYMin : lerp(camYMin, targetYMin, CAM_LAG);
+  camYMax = camYMax === null ? targetYMax : lerp(camYMax, targetYMax, CAM_LAG);
+
+  void chart.updateOptions(
+    {
+      xaxis: { min: camXMin, max: camXMax },
+      // Keep label formatter when updating min/max (Apex replaces yaxis config).
+      yaxis: {
+        min: camYMin,
+        max: camYMax,
+        decimalsInFloat: 2,
+        labels: { formatter: formatYLabel2 },
+      },
+    },
+    false,
+    false,
+  );
+
+  // Update only the LINE series (band is static and updated on draw calls).
+  void chart.updateSeries(
+    [
+      { name: "Spot (in range)", type: "line", data: inRangeSeries },
+      { name: "Spot (out of range)", type: "line", data: outRangeSeries },
+      { name: "Forecast band", type: "rangeArea", data: cachedBand },
+    ],
+    false,
+  );
+
+  rafId = requestAnimationFrame(tickRaf);
+}
+
+export function drawLiveForecastChart(getSeries: () => LiveForecastSeries) {
+  const chart = ensureLiveChart();
+  if (!chart || !liveChartReady) return;
+
+  const { prices, pendingForwardBand } = getSeries();
+  if (prices.length === 0) return;
+
+  const snapshot = getSeries();
+  latestInputSeries = snapshot;
+
+  // Use a monotonic x-axis so the ring-buffer shift doesn't “teleport” the chart.
+  const newest = prices.length > 0 ? prices[prices.length - 1] : null;
+  // Update forecast band only when inputs change (no animation).
+  const nextBandKey = bandKeyFrom(snapshot);
+  if (nextBandKey !== lastBandKey) {
+    lastBandKey = nextBandKey;
+
+    // Forward range: from the moment the forecast is loaded, project BAND_FUTURE_SECONDS ahead.
+    // IMPORTANT: we do not advance liveXCounter here; RAF tick does that on real price changes.
+    if (
+      pendingForwardBand &&
+      Number.isFinite(pendingForwardBand.low) &&
+      Number.isFinite(pendingForwardBand.high)
+    ) {
+      const newStartX = liveXCounter;
+      const lo = Math.min(pendingForwardBand.low, pendingForwardBand.high);
+      const hi = Math.max(pendingForwardBand.low, pendingForwardBand.high);
+
+      // Keep the previous (active) band visible up to the new band's start.
+      if (
+        bandStartX !== null &&
+        activeBandLo !== null &&
+        activeBandHi !== null &&
+        newStartX > bandStartX
+      ) {
+        bandSegs.push({
+          x0: bandStartX,
+          x1: newStartX,
+          lo: Math.min(activeBandLo, activeBandHi),
+          hi: Math.max(activeBandLo, activeBandHi),
+        });
+      }
+
+      // Start the new active band.
+      bandStartX = newStartX;
+      activeBandLo = lo;
+      activeBandHi = hi;
+
+      // Cap number of historical segments so we don't grow forever.
+      if (bandSegs.length > 6) bandSegs = bandSegs.slice(bandSegs.length - 6);
+
+      // Materialize to rangeArea points; insert a gap between segments.
+      const segs: BandSeg[] = [
+        ...bandSegs,
+        { x0: bandStartX, x1: bandStartX + BAND_FUTURE_SECONDS, lo, hi },
+      ];
+      const out: { x: number; y: [number, number] }[] = [];
+      for (const s of segs) {
+        out.push({ x: s.x0, y: [s.lo, s.hi] });
+        out.push({ x: s.x1, y: [s.lo, s.hi] });
+        out.push({ x: s.x1, y: [null as unknown as number, null as unknown as number] });
+      }
+      cachedBand = out;
     } else {
-      const y0 = yAt(p0);
-      const y1 = yAt(p1);
-      purpleYRaw = y0 + (y1 - y0) * localT;
-    }
-  }
-  const plotMidY = pad + plotH / 2;
-  const yCamShift = plotMidY - purpleYRaw;
-  const yDraw = (p: number) => yAt(p) + yCamShift;
-  const purpleMarkerY = plotMidY;
-
-  ctx.strokeStyle = "#253055";
-  ctx.lineWidth = 1;
-  for (let i = 0; i < 4; i += 1) {
-    const gy = pad + ((height - pad * 2) * i) / 3 + yCamShift;
-    ctx.beginPath();
-    ctx.moveTo(pad, gy);
-    ctx.lineTo(width - pad, gy);
-    ctx.stroke();
-  }
-
-  const MIN_BAND_PX = 6;
-
-  type LiveSeg = {
-    x0: number;
-    y0: number;
-    p0: number;
-    x1: number;
-    y1: number;
-    p1: number;
-    /** Price path index of the segment end (outcome); tunnel [start,end] uses this for band lookup. */
-    outcomeIdx: number;
-  };
-  const trailSegs: LiveSeg[] = [];
-  const fTrail = livePurpleFloatIdx;
-  const fFloor = Math.floor(fTrail);
-  const fFrac = fTrail - fFloor;
-
-  const bandBoundsForAnchor = (anchorIdx: number): { low: number; high: number } | null => {
-    const loF = forwardForecastLow[anchorIdx];
-    const hiF = forwardForecastHigh[anchorIdx];
-    if (
-      loF !== null &&
-      hiF !== null &&
-      Number.isFinite(loF) &&
-      Number.isFinite(hiF)
-    ) {
-      return { low: Math.min(loF, hiF), high: Math.max(loF, hiF) };
-    }
-    const sig = forwardForecastSigma[anchorIdx];
-    const anchor = prices[anchorIdx];
-    if (sig === null || sig <= 0 || !Number.isFinite(anchor)) return null;
-    const lo = anchor * (1 - sig);
-    const hi = anchor * (1 + sig);
-    return { low: Math.min(lo, hi), high: Math.max(lo, hi) };
-  };
-
-  /**
-   * Same ±σ corridor as the dashed tunnel drawn over this path index (active first, then archived).
-   * Tunnels extend [startIdx, endIdx] at fixed anchorPrice/σ — not the same as per-step forwardForecast*,
-   * which made red/blue disagree with what you see.
-   */
-  const bandForOutcomePathIndex = (j: number): { low: number; high: number } | null => {
-    if (j < 0 || j > lastIdx) return null;
-    // Strictly after anchor index: path slot `activeTunnelStartIdx` is the forecast anchor dot;
-    // the first *outcome* for the new σ is at +1. Using active band at the anchor caused blue one tick early.
-    if (
-      activeTunnelStartIdx !== null &&
-      activeTunnelSigma !== null &&
-      Number.isFinite(activeTunnelSigma) &&
-      activeTunnelSigma > 0 &&
-      activeTunnelAnchorPrice !== null &&
-      Number.isFinite(activeTunnelAnchorPrice) &&
-      j > activeTunnelStartIdx &&
-      j <= lastIdx
-    ) {
-      const a = activeTunnelAnchorPrice;
-      const s = activeTunnelSigma;
-      const lo = a * (1 - s);
-      const hi = a * (1 + s);
-      return { low: Math.min(lo, hi), high: Math.max(lo, hi) };
-    }
-    for (let ti = tunnelBands.length - 1; ti >= 0; ti -= 1) {
-      const b = tunnelBands[ti];
-      if (j < b.startIdx || j > b.endIdx) continue;
-      if (!Number.isFinite(b.sigma) || b.sigma <= 0 || !Number.isFinite(b.anchorPrice)) continue;
-      const a = b.anchorPrice;
-      const s = b.sigma;
-      const lo = a * (1 - s);
-      const hi = a * (1 + s);
-      return { low: Math.min(lo, hi), high: Math.max(lo, hi) };
-    }
-    const aidx = Math.max(0, j - 1);
-    return bandBoundsForAnchor(aidx);
-  };
-
-  const activeTunnelBandFlat = (): { low: number; high: number } | null => {
-    if (
-      activeTunnelSigma === null ||
-      !Number.isFinite(activeTunnelSigma) ||
-      activeTunnelSigma <= 0 ||
-      activeTunnelAnchorPrice === null ||
-      !Number.isFinite(activeTunnelAnchorPrice)
-    ) {
-      return null;
-    }
-    const a = activeTunnelAnchorPrice;
-    const s = activeTunnelSigma;
-    const lo = a * (1 - s);
-    const hi = a * (1 + s);
-    return { low: Math.min(lo, hi), high: Math.max(lo, hi) };
-  };
-
-  /**
-   * When a new forecast sits above/below the previous (disjoint tunnels), don't let “inside the old
-   * range” turn the stroke blue — keep comparing to the latest corridor until price enters it.
-   */
-  const bandForTrailStroke = (j: number): { low: number; high: number } | null => {
-    const step = bandForOutcomePathIndex(j);
-    const active = activeTunnelBandFlat();
-    if (!active) return step;
-    if (activeTunnelStartIdx !== null && j >= activeTunnelStartIdx && j <= lastIdx) {
-      return step;
-    }
-    if (!step) return active;
-    const scale = Math.max(
-      Math.abs(step.low),
-      Math.abs(step.high),
-      Math.abs(active.low),
-      Math.abs(active.high),
-      1,
-    );
-    const eps = scale * 1e-9;
-    if (step.high < active.low - eps || step.low > active.high + eps) {
-      return active;
-    }
-    return step;
-  };
-
-  const headOutcomeIdx =
-    lastIdx <= 0 ? 0 : Math.min(Math.max(0, Math.ceil(livePurpleFloatIdx)), lastIdx);
-  const trailColorBand = bandForTrailStroke(headOutcomeIdx);
-
-  let pTip: number;
-  if (lastIdx <= 0) {
-    pTip = prices[0];
-  } else {
-    const i0 = Math.min(Math.max(0, Math.floor(livePurpleFloatIdx)), lastIdx - 1);
-    const localT = livePurpleFloatIdx - i0;
-    pTip = prices[i0] + (prices[i0 + 1] - prices[i0]) * localT;
-  }
-
-  const tailEndJ = Math.min(purplePathStartIdx, lastIdx);
-  for (let j = 1; j <= tailEndJ; j += 1) {
-    const p0 = prices[j - 1];
-    const p1 = prices[j];
-    trailSegs.push({
-      x0: xAtIdx(j - 1),
-      y0: yDraw(p0),
-      p0,
-      x1: xAtIdx(j),
-      y1: yDraw(p1),
-      p1,
-      outcomeIdx: j,
-    });
-  }
-  const pathFullEndJ = Math.min(fFloor, lastIdx);
-  for (let j = purplePathStartIdx + 1; j <= pathFullEndJ; j += 1) {
-    const p0 = prices[j - 1];
-    const p1 = prices[j];
-    trailSegs.push({
-      x0: xAtIdx(j - 1),
-      y0: yDraw(p0),
-      p0,
-      x1: xAtIdx(j),
-      y1: yDraw(p1),
-      p1,
-      outcomeIdx: j,
-    });
-  }
-
-  if (fFrac > 1e-6 && fFloor < lastIdx && fFloor >= purplePathStartIdx) {
-    const p0 = prices[fFloor];
-    const p1 = prices[fFloor + 1];
-    const pst = p0 + (p1 - p0) * fFrac;
-    trailSegs.push({
-      x0: xAtFloat(fFloor),
-      y0: yDraw(p0),
-      p0,
-      x1: xAtFloat(fFloor + fFrac),
-      y1: yDraw(pst),
-      p1: pst,
-      outcomeIdx: fFloor + 1,
-    });
-  }
-
-  const drawTunnel = (
-    startIdx: number,
-    endIdx: number,
-    anchorPrice: number,
-    sigma: number,
-    opts?: { xEndPx?: number },
-  ) => {
-    const low = anchorPrice * (1 - sigma);
-    const high = anchorPrice * (1 + sigma);
-    const yLow = yDraw(low);
-    const yHigh = yDraw(high);
-    const xStart = xAtIdx(startIdx);
-    const xEndRaw = xAtIdx(endIdx);
-    const xEnd =
-      typeof opts?.xEndPx === "number" && Number.isFinite(opts.xEndPx)
-        ? Math.max(xEndRaw, opts.xEndPx)
-        : xEndRaw;
-
-    ctx.save();
-    ctx.strokeStyle = CHART_RANGE;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([6, 5]);
-    ctx.beginPath();
-    ctx.moveTo(xStart, yLow);
-    ctx.lineTo(xEnd, yLow);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(xStart, yHigh);
-    ctx.lineTo(xEnd, yHigh);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    if (Math.abs(yHigh - yLow) < MIN_BAND_PX) {
-      const mid = (yHigh + yLow) / 2;
-      const half = MIN_BAND_PX / 2;
-      ctx.beginPath();
-      ctx.moveTo(xStart, mid - half);
-      ctx.lineTo(xEnd, mid - half);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(xStart, mid + half);
-      ctx.lineTo(xEnd, mid + half);
-      ctx.stroke();
-    }
-    ctx.restore();
-  };
-
-  for (const b of tunnelBands) {
-    if (!Number.isFinite(b.sigma) || b.sigma <= 0) continue;
-    if (b.startIdx >= n) continue;
-    if (b.endIdx < 0) continue;
-    drawTunnel(Math.max(0, b.startIdx), Math.min(n - 1, Math.max(b.endIdx, 0)), b.anchorPrice, b.sigma);
-  }
-
-  if (
-    activeTunnelSigma !== null &&
-    activeTunnelSigma > 0 &&
-    activeTunnelAnchorPrice !== null &&
-    Number.isFinite(activeTunnelAnchorPrice) &&
-    activeTunnelStartIdx !== null &&
-    activeTunnelStartIdx >= 0 &&
-    activeTunnelStartIdx < n
-  ) {
-    const tunnelEndIdx = Math.max(n - 1, activeTunnelStartIdx);
-    const plotRightX = width - pad;
-    drawTunnel(activeTunnelStartIdx, tunnelEndIdx, activeTunnelAnchorPrice, activeTunnelSigma, {
-      xEndPx: Math.max(xAtIdx(tunnelEndIdx), plotRightX),
-    });
-  }
-
-  const strokeTrailSegment = (
-    x0: number,
-    y0: number,
-    p0: number,
-    x1: number,
-    y1: number,
-    p1: number,
-    outcomeIdx: number,
-  ) => {
-    ctx.save();
-    ctx.shadowBlur = 0;
-    ctx.strokeStyle = LIVE_DOT_OUTLINE_COLOR;
-    ctx.lineWidth = LIVE_LINE_OUTLINE_WIDTH;
-    ctx.beginPath();
-    ctx.moveTo(x0, y0);
-    ctx.lineTo(x1, y1);
-    ctx.stroke();
-    ctx.restore();
-
-    const drawSolid = (stroke: string, glow: string) => {
-      ctx.save();
-      ctx.strokeStyle = stroke;
-      ctx.lineWidth = LIVE_TRAIL_STROKE_WIDTH;
-      ctx.shadowBlur = LIVE_LINE_GLOW_BLUR;
-      ctx.shadowColor = glow;
-      ctx.beginPath();
-      ctx.moveTo(x0, y0);
-      ctx.lineTo(x1, y1);
-      ctx.stroke();
-      ctx.restore();
-    };
-
-    if (!Number.isFinite(p0) || !Number.isFinite(p1)) {
-      drawSolid(CHART_PRICE_LINE, LIVE_LINE_GLOW_COLOR_OK);
-      return;
-    }
-
-    const band = bandForTrailStroke(outcomeIdx);
-    if (band === null) {
-      drawSolid(CHART_PRICE_LINE, LIVE_LINE_GLOW_COLOR_OK);
-      return;
-    }
-    const { low, high } = band;
-
-    const inside = (p: number) => p >= low && p <= high;
-    const priceScale = Math.max(Math.abs(p0), Math.abs(p1), Math.abs(low), Math.abs(high), 1);
-    const flatEps = Math.max(1e-12, priceScale * 1e-12);
-    const denom = p1 - p0;
-    if (Math.abs(denom) < flatEps) {
-      const segBad = !inside((p0 + p1) * 0.5);
-      drawSolid(
-        segBad ? CHART_DOT_OUTSIDE : CHART_PRICE_LINE,
-        segBad ? LIVE_LINE_GLOW_COLOR_BAD : LIVE_LINE_GLOW_COLOR_OK,
-      );
-      return;
-    }
-
-    const ts: number[] = [];
-    const pushT = (b: number) => {
-      const t = (b - p0) / denom;
-      if (t > 1e-9 && t < 1 - 1e-9 && Number.isFinite(t)) ts.push(t);
-    };
-    pushT(low);
-    pushT(high);
-    ts.sort((a, b) => a - b);
-    const uniq: number[] = [];
-    for (const t of ts) {
-      if (uniq.length === 0 || Math.abs(t - uniq[uniq.length - 1]) > 1e-6) uniq.push(t);
-    }
-    const cuts = [0, ...uniq, 1];
-    for (let i = 0; i < cuts.length - 1; i += 1) {
-      const a = cuts[i];
-      const b = cuts[i + 1];
-      if (b - a <= 1e-6) continue;
-      const mid = (a + b) / 2;
-      const pmid = p0 + denom * mid;
-      const segBad = !inside(pmid);
-      const xa = x0 + (x1 - x0) * a;
-      const ya = y0 + (y1 - y0) * a;
-      const xb = x0 + (x1 - x0) * b;
-      const yb = y0 + (y1 - y0) * b;
-      ctx.save();
-      ctx.strokeStyle = segBad ? CHART_DOT_OUTSIDE : CHART_PRICE_LINE;
-      ctx.lineWidth = LIVE_TRAIL_STROKE_WIDTH;
-      ctx.shadowBlur = LIVE_LINE_GLOW_BLUR;
-      ctx.shadowColor = segBad ? LIVE_LINE_GLOW_COLOR_BAD : LIVE_LINE_GLOW_COLOR_OK;
-      ctx.beginPath();
-      ctx.moveTo(xa, ya);
-      ctx.lineTo(xb, yb);
-      ctx.stroke();
-      ctx.restore();
-    }
-  };
-
-  ctx.lineWidth = LIVE_TRAIL_STROKE_WIDTH;
-  ctx.setLineDash([]);
-  for (const s of trailSegs) {
-    strokeTrailSegment(s.x0, s.y0, s.p0, s.x1, s.y1, s.p1, s.outcomeIdx);
-  }
-
-  const headOk =
-    trailColorBand === null || !Number.isFinite(pTip)
-      ? true
-      : pTip >= trailColorBand.low && pTip <= trailColorBand.high;
-
-  if (n >= 1) {
-    const tx = centerSlotX;
-    const ty = purpleMarkerY;
-    if (Number.isFinite(tx) && Number.isFinite(ty)) {
-      ctx.save();
-      ctx.shadowBlur = LIVE_DOT_SHADOW_BLUR;
-      ctx.shadowColor = headOk ? LIVE_LINE_GLOW_COLOR_OK : LIVE_LINE_GLOW_COLOR_BAD;
-      ctx.fillStyle = headOk ? CHART_PRICE_LINE : CHART_DOT_OUTSIDE;
-      ctx.beginPath();
-      ctx.arc(tx, ty, LIVE_TIP_DOT_RADIUS, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.shadowBlur = 0;
-      ctx.lineWidth = LIVE_DOT_OUTLINE_WIDTH;
-      ctx.strokeStyle = LIVE_DOT_OUTLINE_COLOR;
-      ctx.stroke();
-      ctx.restore();
+      bandStartX = null;
+      activeBandLo = null;
+      activeBandHi = null;
+      bandSegs = [];
+      cachedBand = [];
     }
   }
 
-  if (lastIdx > purplePathStartIdx) {
-    if (!livePurpleAnimRaf) {
-      livePurpleAnimRaf = requestAnimationFrame(() => {
-        livePurpleAnimRaf = 0;
-        drawLiveForecastChart(getSeries);
-      });
+  // Start/retarget the tip animation when the newest observed spot changes.
+  if (newest !== null && Number.isFinite(newest)) {
+    const nowMs = performance.now();
+    if (tipTargetPrice === null) {
+      tipStartPrice = newest;
+      tipTargetPrice = newest;
+      tipAnimStartMs = nowMs;
+    } else if (newest !== tipTargetPrice) {
+      // Retarget smoothly from the current animated tip.
+      let tipNow = tipTargetPrice;
+      if (snapshot.prices.length >= 2) {
+        const prev = snapshot.prices[snapshot.prices.length - 2];
+        const t = (nowMs - tipAnimStartMs) / TIP_ANIM_MS;
+        const t01 = smoothStep(Math.max(0, Math.min(1, t)));
+        tipNow = lerp(prev, tipTargetPrice, t01);
+      }
+      tipStartPrice = tipNow;
+      tipTargetPrice = newest;
+      tipAnimStartMs = nowMs;
     }
-  } else if (livePurpleAnimRaf) {
-    cancelAnimationFrame(livePurpleAnimRaf);
-    livePurpleAnimRaf = 0;
   }
 }

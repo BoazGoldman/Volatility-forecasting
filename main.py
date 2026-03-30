@@ -1,32 +1,16 @@
+from __future__ import annotations
+
+import json
+import math
+import os
 import time
 from datetime import datetime, timedelta, timezone
-import json
 from pathlib import Path
-import os
-import math
 
 import pandas as pd
 
-from src.pipeline import run_garch_pipeline
-from src.live_garch import (
-    LiveGarch11,
-    fetch_recent_bars,
-    fetch_recent_10s_bars,
-    floor_dt_to_step,
-    latest_closed_10s_return_pct,
-    next_10s_boundary_utc,
-)
-from src.storage import (
-    init_forecasts_db,
-    keep_latest_n_forecasts,
-    keep_only_timestamps,
-    read_selected_forecasts,
-    read_forecast_at,
-    upsert_forecasts,
-    insert_forecast_error,
-    keep_latest_n_forecast_errors,
-    read_latest_forecast_errors,
-)
+from src.live_garch import LiveGarch11, fetch_recent_bars, floor_dt_to_step
+from src.storage import init_forecasts_db, keep_latest_n_forecasts, read_selected_forecasts, upsert_forecasts
 
 
 def _env_int(name: str, default: int) -> int:
@@ -47,204 +31,31 @@ def _env_str(name: str, default: str) -> str:
     return val if val else default
 
 
-HOURLY_FORECAST_INTERVAL_SEC = _env_int("HOURLY_FORECAST_INTERVAL_SEC", 3600)
-HOURLY_REFIT_INTERVAL_SEC = _env_int("HOURLY_REFIT_INTERVAL_SEC", 7 * 24 * 60 * 60)
-HOURLY_FETCH_LIMIT = _env_int("HOURLY_FETCH_LIMIT", 2000)
-HOURLY_KEEP_MIDNIGHTS = _env_int("HOURLY_KEEP_MIDNIGHTS", 30)
-HOURLY_BACKFILL_DAYS = _env_int("HOURLY_BACKFILL_DAYS", 14)
-"""How often to refit the 10s-candle GARCH. Lower if you want; 10s fits are CPU-heavy."""
-TEN_SEC_REFIT_INTERVAL_SEC = _env_int("TEN_SEC_REFIT_INTERVAL_SEC", 1800)
-TEN_SEC_FETCH_LIMIT_1S = _env_int("TEN_SEC_FETCH_LIMIT_1S", 1000)
-TEN_SEC_BOUNDARY_DELAY_MS = _env_int("TEN_SEC_BOUNDARY_DELAY_MS", 300)
-TEN_SEC_DB_TIMEFRAME = _env_str("TEN_SEC_DB_TIMEFRAME", "10s")
-TEN_SEC_KEEP_ROWS = _env_int("TEN_SEC_KEEP_ROWS", 6)
 DB_PATH = _env_str("DB_PATH", "data/forecasts.db")
 SYMBOL = _env_str("SYMBOL", "BTC/USDT")
-TIMEFRAME = _env_str("TIMEFRAME", "1h")
-WEB_FORECAST_JSON = _env_str("WEB_FORECAST_JSON", "web/public/forecasts.json")
-WEB_FORECAST_10S_JSON = _env_str("WEB_FORECAST_10S_JSON", "web/public/forecasts_10s.json")
-WEB_ERRORS_24H_JSON = _env_str("WEB_ERRORS_24H_JSON", "web/public/errors_24h.json")
 
-ERROR_LOG_KEEP_ROWS = _env_int("ERROR_LOG_KEEP_ROWS", 25)
-DAILY_ERROR_DELAY_MS = _env_int("DAILY_ERROR_DELAY_MS", 1500)
-DAILY_ERROR_BACKFILL_DAYS = _env_int("DAILY_ERROR_BACKFILL_DAYS", 20)
+KEEP_LAST_N = _env_int("KEEP_LAST_N", 30)
 
+# 60s-forward model (runs every minute; built on 5s candles; 12 steps = 60 seconds)
+MINUTE_STEP_SECONDS = 60  # scheduling cadence / write frequency
+FAST_STEP_SECONDS = 5
+FAST_HORIZON_STEPS = 12
+MINUTE_BOUNDARY_DELAY_MS = _env_int("MINUTE_BOUNDARY_DELAY_MS", 600)
+MINUTE_FETCH_LIMIT_1S = _env_int("MINUTE_FETCH_LIMIT_1S", 7200)
+MINUTE_REFIT_INTERVAL_SEC = _env_int("MINUTE_REFIT_INTERVAL_SEC", 15 * 60)
+MINUTE_DB_TIMEFRAME = _env_str("MINUTE_DB_TIMEFRAME", "5s_60s")
+WEB_FORECAST_60S_JSON = _env_str("WEB_FORECAST_60S_JSON", "web/public/forecasts_60s.json")
 
-def select_last_n_midnights_plus_latest(df: pd.DataFrame, *, n_midnights: int) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
-    out = df.copy()
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
-    out = out.dropna(subset=["timestamp", "garch_forecast"]).sort_values("timestamp")
-    if out.empty:
-        return out
-
-    n = max(int(n_midnights), 0)
-    midnights = out[
-        (out["timestamp"].dt.hour == 0)
-        & (out["timestamp"].dt.minute == 0)
-        & (out["timestamp"].dt.second == 0)
-    ]
-    if n > 0:
-        midnights = midnights.tail(n)
-    else:
-        midnights = midnights.tail(0)
-
-    latest_row = out.tail(1)
-    selected = pd.concat([midnights, latest_row], ignore_index=True)
-    selected = selected.drop_duplicates(subset=["timestamp"], keep="last")
-    return selected.sort_values("timestamp").copy()
+# Daily 24h-forward model (runs at 00:00 UTC only, forecasts next 24 hours)
+HOURLY_TIMEFRAME = _env_str("HOURLY_TIMEFRAME", "1h")
+DAILY_MIDNIGHT_DELAY_MS = _env_int("DAILY_MIDNIGHT_DELAY_MS", 2500)
+DAILY_FETCH_LIMIT_1H = _env_int("DAILY_FETCH_LIMIT_1H", 3000)
+DAILY_DB_TIMEFRAME = _env_str("DAILY_DB_TIMEFRAME", "1h_24h_at_00utc")
+WEB_FORECAST_24H_JSON = _env_str("WEB_FORECAST_24H_JSON", "web/public/forecasts_24h.json")
 
 
-def backfill_hourly_midnights(*, days: int) -> None:
-    """
-    Recompute recent hourly forecasts and ensure we have midnight (00:00 UTC) rows in the DB.
-    This is useful if the loop was offline around midnight and the UI needs yesterday's band.
-    """
-    d = max(int(days), 0)
-    if d <= 0:
-        return
-
-    # Fetch enough 1h history to cover `days` plus a small buffer.
-    need = min(max(d * 24 + 72, 200), HOURLY_FETCH_LIMIT)
-    try:
-        df = run_garch_pipeline(
-            symbol=SYMBOL,
-            exchange_name="binance",
-            timeframe=TIMEFRAME,
-            limit=need,
-            # Use a smaller baseline window so backfill works on shorter history.
-            baseline_window_step=min(48, max(12, need // 20)),
-            garch_horizon_step=24,
-            eval_window_step=24,
-            eval_target_shift_steps=24,
-        )
-    except Exception as exc:
-        print(f"Backfill: hourly pipeline failed: {exc}")
-        return
-
-    selected = select_last_n_midnights_plus_latest(df, n_midnights=HOURLY_KEEP_MIDNIGHTS)
-    if selected.empty:
-        print("Backfill: no rows selected (empty).")
-        return
-
-    upserted = upsert_forecasts(selected, db_path=DB_PATH, symbol=SYMBOL, timeframe=TIMEFRAME)
-    keep_ts = [
-        pd.to_datetime(ts, utc=True).isoformat() for ts in selected["timestamp"].tolist()
-    ]
-    keep_only_timestamps(DB_PATH, symbol=SYMBOL, timeframe=TIMEFRAME, timestamps_iso=keep_ts)
-    _export_hourly_forecasts_json(extra={"backfill_days": d, "kept_midnights": HOURLY_KEEP_MIDNIGHTS})
-    print(f"Backfill: upserted {upserted} rows; kept {len(keep_ts)} timestamps")
-
-
-def backfill_daily_24h_errors(*, days: int) -> None:
-    """
-    Backfill the daily "24h" error series used by the 7d UI rollup (`errors_24h.json`).
-
-    For each day D (00:00 UTC), we score the close of day D (yesterday close) against the
-    midnight forecast band from D (σ stored at forecast_time=D 00:00 UTC in the hourly series).
-    """
-    d = max(int(days), 0)
-    if d <= 0:
-        return
-
-    now_utc = datetime.now(timezone.utc)
-    today_midnight = floor_dt_to_step(now_utc, 24 * 60 * 60)
-    # We can only score days strictly before today's midnight.
-    end_day = today_midnight - timedelta(days=1)
-    start_day = end_day - timedelta(days=d - 1)
-
-    try:
-        bars_1d = fetch_recent_bars(symbol=SYMBOL, exchange_name="binance", timeframe="1d", limit=d + 5)
-    except Exception as exc:
-        print(f"24h backfill: fetch 1d failed: {exc}")
-        return
-    if bars_1d.empty:
-        return
-
-    ts = pd.to_datetime(bars_1d["timestamp"], utc=True, errors="coerce")
-    work = bars_1d.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
-
-    day = start_day
-    wrote = 0
-    while day <= end_day:
-        # day is D 00:00 UTC; we need close of candle opened at D, and base close from D-1.
-        y_row = work[work["timestamp"] == pd.Timestamp(day)].tail(1)
-        prev_row = work[work["timestamp"] == pd.Timestamp(day - timedelta(days=1))].tail(1)
-        if y_row.empty or prev_row.empty:
-            day += timedelta(days=1)
-            continue
-
-        y_close = float(y_row.iloc[0]["close"])
-        base_close = float(prev_row.iloc[0]["close"])
-        if y_close <= 0 or base_close <= 0:
-            day += timedelta(days=1)
-            continue
-
-        sigma = read_forecast_at(
-            db_path=DB_PATH,
-            symbol=SYMBOL,
-            timeframe=TIMEFRAME,
-            forecast_time_iso=day.isoformat(),
-        )
-        if sigma is None or not (sigma > 0):
-            day += timedelta(days=1)
-            continue
-
-        low = base_close * (1 - sigma)
-        high = base_close * (1 + sigma)
-        lo = min(low, high)
-        hi = max(low, high)
-        side = "inside"
-        outside_frac = 0.0
-        if y_close > hi:
-            side = "above"
-            outside_frac = (y_close - hi) / base_close
-        elif y_close < lo:
-            side = "below"
-            outside_frac = (lo - y_close) / base_close
-
-        try:
-            insert_forecast_error(
-                db_path=DB_PATH,
-                symbol=SYMBOL,
-                series="24h",
-                event_time_iso=day.isoformat(),
-                anchor_price=base_close,
-                actual_price=y_close,
-                sigma=sigma,
-                low=lo,
-                high=hi,
-                outside_frac=outside_frac,
-                side=side,
-            )
-            wrote += 1
-        except Exception as exc:
-            print(f"24h backfill: write failed for {day.date().isoformat()}: {exc}")
-
-        day += timedelta(days=1)
-
-    try:
-        keep_latest_n_forecast_errors(
-            db_path=DB_PATH, symbol=SYMBOL, series="24h", n=max(ERROR_LOG_KEEP_ROWS, d + 5)
-        )
-        export_errors_json(series="24h", out_path=WEB_ERRORS_24H_JSON)
-    except Exception as exc:
-        print(f"24h backfill: prune/export failed: {exc}")
-
-    print(f"24h backfill: wrote/updated {wrote} rows ({start_day.date()}..{end_day.date()})")
-
-
-def export_forecasts_json(
-    db_path: str,
-    out_path: str,
-    symbol: str,
-    timeframe: str,
-    *,
-    forecasts_newest_first: bool = False,
-    extra: dict | None = None,
-) -> None:
-    df = read_selected_forecasts(db_path=db_path, symbol=symbol, timeframe=timeframe)
+def _export_forecasts_json(*, out_path: str, symbol: str, timeframe: str, extra: dict | None = None) -> None:
+    df = read_selected_forecasts(db_path=DB_PATH, symbol=symbol, timeframe=timeframe)
     payload: dict = {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -253,405 +64,299 @@ def export_forecasts_json(
     }
     if extra:
         payload.update(extra)
+
     if not df.empty:
-        rows = [
+        payload["forecasts"] = [
             {
                 "timestamp": pd.to_datetime(row["timestamp"], utc=True).isoformat(),
                 "garch_forecast": float(row["garch_forecast"]),
             }
             for _, row in df.iterrows()
+            if pd.notna(pd.to_datetime(row["timestamp"], utc=True, errors="coerce"))
+            and pd.notna(row["garch_forecast"])
         ]
-        if forecasts_newest_first:
-            rows.reverse()
-        payload["forecasts"] = rows
 
     target = Path(out_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def export_errors_json(*, series: str, out_path: str) -> None:
-    df = read_latest_forecast_errors(db_path=DB_PATH, symbol=SYMBOL, series=series, limit=ERROR_LOG_KEEP_ROWS)
-    payload = {
-        "symbol": SYMBOL,
-        "series": series,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "errors": [],
+def _resample_ohlcv(df_1s: pd.DataFrame, *, step_seconds: int) -> pd.DataFrame:
+    if df_1s.empty:
+        return df_1s.copy()
+
+    work = df_1s.copy()
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+    work = work.dropna(subset=["timestamp"]).sort_values("timestamp")
+    if work.empty:
+        return work
+
+    work = work.set_index("timestamp")
+    rule = f"{int(step_seconds)}s"
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
     }
-    if not df.empty:
-        payload["errors"] = [
-            {
-                "event_time": pd.to_datetime(row["event_time"], utc=True).isoformat(),
-                "outside_frac": None if pd.isna(row["outside_frac"]) else float(row["outside_frac"]),
-                "side": None if pd.isna(row["side"]) else str(row["side"]),
-            }
-            for _, row in df.iterrows()
-        ]
-    target = Path(out_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if "volume" in work.columns:
+        agg["volume"] = "sum"
+
+    out = work.resample(rule, label="right", closed="right").agg(agg).dropna(subset=["close"])
+    out = out.reset_index()
+    return out
 
 
-def run_daily_24h_error_tick(*, last_scored_day: datetime | None) -> datetime | None:
-    """
-    Once per day (after 00:00 UTC), score yesterday's daily close vs the midnight 24h band.
-
-    Uses:
-      - daily candles (1d) for closes (yesterday close and day-before close)
-      - forecast σ stored at `forecast_time = yesterday 00:00 UTC` in the `1h` forecast series
-        (that's the row the 7d chart uses as "midnight forecast").
-    Writes to error series "24h" and exports `errors_24h.json`.
-    """
-    now_utc = datetime.now(timezone.utc)
-    today_midnight = floor_dt_to_step(now_utc, 24 * 60 * 60)
-    # We can only score "yesterday" after today's midnight has passed.
-    if now_utc < today_midnight + timedelta(milliseconds=DAILY_ERROR_DELAY_MS):
-        return last_scored_day
-
-    day_to_score = today_midnight - timedelta(days=1)  # yesterday 00:00
-    if last_scored_day is not None and day_to_score <= last_scored_day:
-        return last_scored_day
-
-    try:
-        bars_1d = fetch_recent_bars(
-            symbol=SYMBOL, exchange_name="binance", timeframe="1d", limit=10
-        )
-    except Exception as exc:
-        print(f"24h daily error: fetch 1d failed: {exc}")
-        return last_scored_day
-
-    if bars_1d.empty:
-        return last_scored_day
-
-    # Find yesterday candle and previous candle by open timestamp (00:00 UTC).
-    ts = pd.to_datetime(bars_1d["timestamp"], utc=True, errors="coerce")
-    work = bars_1d.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
-    y_row = work[work["timestamp"] == pd.Timestamp(day_to_score)].tail(1)
-    prev_row = work[work["timestamp"] == pd.Timestamp(day_to_score - timedelta(days=1))].tail(1)
-    if y_row.empty or prev_row.empty:
-        return last_scored_day
-
-    y_close = float(y_row.iloc[0]["close"])
-    base_close = float(prev_row.iloc[0]["close"])
-    if y_close <= 0 or base_close <= 0:
-        return last_scored_day
-
-    sigma = read_forecast_at(
-        db_path=DB_PATH,
-        symbol=SYMBOL,
-        timeframe=TIMEFRAME,
-        forecast_time_iso=day_to_score.isoformat(),
-    )
-    if sigma is None or not (sigma > 0):
-        return last_scored_day
-
-    low = base_close * (1 - sigma)
-    high = base_close * (1 + sigma)
-    lo = min(low, high)
-    hi = max(low, high)
-    side = "inside"
-    outside_frac = 0.0
-    if y_close > hi:
-        side = "above"
-        outside_frac = (y_close - hi) / base_close
-    elif y_close < lo:
-        side = "below"
-        outside_frac = (lo - y_close) / base_close
-
-    try:
-        insert_forecast_error(
-            db_path=DB_PATH,
-            symbol=SYMBOL,
-            series="24h",
-            event_time_iso=day_to_score.isoformat(),
-            anchor_price=base_close,
-            actual_price=y_close,
-            sigma=sigma,
-            low=lo,
-            high=hi,
-            outside_frac=outside_frac,
-            side=side,
-        )
-        keep_latest_n_forecast_errors(
-            db_path=DB_PATH, symbol=SYMBOL, series="24h", n=ERROR_LOG_KEEP_ROWS
-        )
-        export_errors_json(series="24h", out_path=WEB_ERRORS_24H_JSON)
-        print(
-            f"24h daily error: {day_to_score.date().isoformat()} "
-            f"{'within band' if side == 'inside' else f'{outside_frac*100:.3f}% {side}'}"
-        )
-    except Exception as exc:
-        print(f"24h daily error: write/export failed: {exc}")
-        return last_scored_day
-
-    return day_to_score
-
-
-def _export_hourly_forecasts_json(extra: dict | None = None) -> None:
-    export_forecasts_json(
-        db_path=DB_PATH,
-        out_path=WEB_FORECAST_JSON,
-        symbol=SYMBOL,
-        timeframe=TIMEFRAME,
-        extra=extra,
-    )
-
-
-def _keep_three_midnights_plus_latest_hourly(latest_ts_iso: str) -> None:
-    df_existing = read_selected_forecasts(DB_PATH, symbol=SYMBOL, timeframe=TIMEFRAME)
-    if df_existing.empty:
-        keep_only_timestamps(
-            DB_PATH, symbol=SYMBOL, timeframe=TIMEFRAME, timestamps_iso=[latest_ts_iso]
-        )
-        return
-
-    df_existing["timestamp"] = pd.to_datetime(
-        df_existing["timestamp"], utc=True, errors="coerce"
-    )
-    df_existing = df_existing.dropna(subset=["timestamp"]).sort_values("timestamp")
-    midnights = df_existing[
-        (df_existing["timestamp"].dt.hour == 0)
-        & (df_existing["timestamp"].dt.minute == 0)
-        & (df_existing["timestamp"].dt.second == 0)
-    ].tail(max(0, HOURLY_KEEP_MIDNIGHTS))
-
-    keep_ts = [ts.isoformat() for ts in midnights["timestamp"].tolist()]
-    keep_ts.append(latest_ts_iso)
-    keep_only_timestamps(DB_PATH, symbol=SYMBOL, timeframe=TIMEFRAME, timestamps_iso=keep_ts)
-
-
-def run_hourly_live_forecast_tick(
-    live: LiveGarch11 | None,
+def _iter_closed_returns_pct(
+    bars: pd.DataFrame,
     *,
-    force_refit: bool,
-) -> LiveGarch11 | None:
+    since_exclusive: datetime | None,
+    until_inclusive: datetime,
+    step_seconds: int,
+) -> list[tuple[datetime, float]]:
     """
-    Produce a fresh 24h (24-step) σ each hour, but only refit params weekly.
+    Return a list of (bar_end_utc, return_pct) for each closed bar boundary in (since, until].
+    Uses consecutive close-to-close returns, so replaying these updates keeps GARCH state consistent
+    even if we only run the loop once per minute.
+    """
+    if bars.empty:
+        return []
+    ts = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
+    work = bars.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
+    if work.empty:
+        return []
 
-    - Refit: fit GARCH(1,1) params on recent 1h bars (slow, weekly).
-    - Hourly tick: update conditional variance with latest closed 1h return (fast),
-      then output σ over the next 24 hours as sqrt(sum of step variances).
+    end_ts = pd.Timestamp(until_inclusive)
+    work = work[work["timestamp"] <= end_ts]
+    if work.empty:
+        return []
+
+    if since_exclusive is not None:
+        start_ts = pd.Timestamp(since_exclusive)
+        work = work[work["timestamp"] > start_ts]
+        # We still need the previous bar close to compute the first return.
+        prev_row = bars.copy()
+        prev_row["timestamp"] = pd.to_datetime(prev_row["timestamp"], utc=True, errors="coerce")
+        prev_row = prev_row.dropna(subset=["timestamp"]).sort_values("timestamp")
+        prev_row = prev_row[prev_row["timestamp"] <= start_ts].tail(1)
+        if prev_row.empty:
+            return []
+        work = pd.concat([prev_row, work], ignore_index=True).sort_values("timestamp")
+
+    rows = []
+    closes = work[["timestamp", "close"]].dropna()
+    closes = closes[closes["close"].astype(float) > 0]
+    if len(closes) < 2:
+        return []
+
+    # Iterate consecutive bars; skip any gaps (non-consecutive timestamps).
+    prev_t = pd.to_datetime(closes.iloc[0]["timestamp"], utc=True).to_pydatetime()
+    prev_c = float(closes.iloc[0]["close"])
+    for i in range(1, len(closes)):
+        t = pd.to_datetime(closes.iloc[i]["timestamp"], utc=True).to_pydatetime()
+        c = float(closes.iloc[i]["close"])
+        if c <= 0 or prev_c <= 0:
+            prev_t, prev_c = t, c
+            continue
+        if abs((t - prev_t).total_seconds() - float(step_seconds)) > 1e-6:
+            prev_t, prev_c = t, c
+            continue
+        r_pct = float(math.log(c / prev_c) * 100.0)
+        rows.append((t, r_pct))
+        prev_t, prev_c = t, c
+
+    # Keep only boundaries <= until_inclusive, and > since_exclusive.
+    out: list[tuple[datetime, float]] = []
+    for t, r in rows:
+        if t <= until_inclusive and (since_exclusive is None or t > since_exclusive):
+            out.append((t, r))
+    return out
+
+
+def _next_boundary_utc(now: datetime, *, step_seconds: int) -> datetime:
+    floored = floor_dt_to_step(now, step_seconds)
+    if floored == now.replace(microsecond=0) and now.microsecond == 0:
+        return floored + timedelta(seconds=step_seconds)
+    return floored + timedelta(seconds=step_seconds)
+
+
+def run_minute_60s_forecast_tick(live: LiveGarch11 | None, *, force_refit: bool) -> LiveGarch11 | None:
+    """
+    Every minute:
+      - fit/update a GARCH(1,1) on 5s bars
+      - replay each closed 5s return since last run (catch up)
+      - write σ forecast for the NEXT 60s (12 steps ahead)
+      - keep last KEEP_LAST_N rows
     """
     now_utc = datetime.now(timezone.utc)
-    bar_end = floor_dt_to_step(now_utc, 60 * 60)
+    minute_end = floor_dt_to_step(now_utc, MINUTE_STEP_SECONDS)
+    fast_end = floor_dt_to_step(now_utc, FAST_STEP_SECONDS)
+
+    try:
+        bars_1s = fetch_recent_bars(
+            symbol=SYMBOL, exchange_name="binance", timeframe="1s", limit=MINUTE_FETCH_LIMIT_1S
+        )
+        bars_5s = _resample_ohlcv(bars_1s, step_seconds=FAST_STEP_SECONDS)
+    except Exception as exc:
+        print(f"60s tick: fetch/resample failed: {exc}")
+        return live
+
+    if force_refit or live is None:
+        try:
+            live = LiveGarch11.fit_from_10s_bars(bars_5s)
+            # Seed last_bar_end to the newest available 5s bar_end so we don't double replay.
+            if not bars_5s.empty:
+                last_ts = pd.to_datetime(bars_5s["timestamp"].iloc[-1], utc=True, errors="coerce")
+                if pd.notna(last_ts):
+                    live.last_bar_end = last_ts.to_pydatetime()
+            print("60s (5s bars): refit ok")
+        except Exception as exc:
+            print(f"60s (5s bars): refit failed: {exc}")
+            return None
+
+    # Catch up: replay every closed 5s return since last_bar_end, up through `fast_end`.
+    last_end = live.last_bar_end
+    returns = _iter_closed_returns_pct(
+        bars_5s,
+        since_exclusive=last_end,
+        until_inclusive=fast_end,
+        step_seconds=FAST_STEP_SECONDS,
+    )
+    if not returns:
+        # Nothing new to update; still allow writing once per minute if we're at a new minute.
+        if last_end is not None and minute_end <= floor_dt_to_step(last_end, MINUTE_STEP_SECONDS):
+            return live
+    else:
+        for t_end, r_pct in returns:
+            sigma_next = live.update_with_return_pct(r_pct)
+            if pd.notna(sigma_next) and sigma_next > 0:
+                live.last_bar_end = t_end
+
+    sigma_60s = live.sigma_horizon(FAST_HORIZON_STEPS)
+    if not pd.notna(sigma_60s) or not (sigma_60s > 0):
+        return live
+
+    forecast_time = minute_end + timedelta(seconds=MINUTE_STEP_SECONDS)
+    df_out = pd.DataFrame([{"timestamp": forecast_time.isoformat(), "garch_forecast": float(sigma_60s)}])
+    upsert_forecasts(df_out, db_path=DB_PATH, symbol=SYMBOL, timeframe=MINUTE_DB_TIMEFRAME)
+    keep_latest_n_forecasts(DB_PATH, symbol=SYMBOL, timeframe=MINUTE_DB_TIMEFRAME, n=KEEP_LAST_N)
+    _export_forecasts_json(
+        out_path=WEB_FORECAST_60S_JSON,
+        symbol=SYMBOL,
+        timeframe=MINUTE_DB_TIMEFRAME,
+        extra={
+            "bar_seconds": FAST_STEP_SECONDS,
+            "horizon_steps": FAST_HORIZON_STEPS,
+            "horizon_seconds": FAST_STEP_SECONDS * FAST_HORIZON_STEPS,
+            "cadence_seconds": MINUTE_STEP_SECONDS,
+            "kept_forecasts": KEEP_LAST_N,
+            "refit_interval_sec": MINUTE_REFIT_INTERVAL_SEC,
+        },
+    )
+    print(f"60s (5s bars): wrote forecast for {forecast_time.isoformat()} σ={float(sigma_60s):.6f}")
+    return live
+
+
+def run_daily_midnight_24h_forecast() -> None:
+    """
+    At 00:00 UTC only:
+      - fit a GARCH(1,1) on 1h bars
+      - compute σ over next 24 hours (24 steps)
+      - write one row at forecast_time = midnight (00:00 UTC)
+      - keep last KEEP_LAST_N rows
+    """
+    now_utc = datetime.now(timezone.utc)
+    midnight = floor_dt_to_step(now_utc, 24 * 60 * 60)
+    # Only run at (or shortly after) midnight.
+    if now_utc < midnight + timedelta(milliseconds=DAILY_MIDNIGHT_DELAY_MS):
+        return
 
     try:
         bars_1h = fetch_recent_bars(
-            symbol=SYMBOL,
-            exchange_name="binance",
-            timeframe=TIMEFRAME,
-            limit=HOURLY_FETCH_LIMIT,
+            symbol=SYMBOL, exchange_name="binance", timeframe=HOURLY_TIMEFRAME, limit=DAILY_FETCH_LIMIT_1H
         )
     except Exception as exc:
-        print(f"1h live tick: fetch failed: {exc}")
-        return live
+        print(f"24h@00:00: fetch failed: {exc}")
+        return
 
-    if force_refit or live is None:
-        try:
-            live = LiveGarch11.fit_from_10s_bars(bars_1h)  # works for any bar size
-            if not bars_1h.empty:
-                last_ts = pd.to_datetime(
-                    bars_1h["timestamp"].iloc[-1], utc=True, errors="coerce"
-                )
-                if pd.notna(last_ts):
-                    live.last_bar_end = last_ts.to_pydatetime()
-            print("1h live: refit ok")
-        except Exception as exc:
-            print(f"1h live: refit failed: {exc}")
-            return None
+    try:
+        model = LiveGarch11.fit_from_10s_bars(bars_1h)
+    except Exception as exc:
+        print(f"24h@00:00: fit failed: {exc}")
+        return
 
-    if live.last_bar_end is not None and bar_end <= live.last_bar_end:
-        return live
-
-    # Compute percent log-return for the latest closed hour.
-    ts = pd.to_datetime(bars_1h["timestamp"], utc=True, errors="coerce")
-    work = bars_1h.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
-    end_ts = pd.Timestamp(bar_end)
-    row_t = work[work["timestamp"] == end_ts].tail(1)
-    row_prev = work[work["timestamp"] == (end_ts - pd.Timedelta(hours=1))].tail(1)
-    if row_t.empty or row_prev.empty:
-        return live
-
-    close_t = float(row_t.iloc[0]["close"])
-    close_prev = float(row_prev.iloc[0]["close"])
-    if close_t <= 0 or close_prev <= 0:
-        return live
-
-    r_pct = float(math.log(close_t / close_prev) * 100.0)
-    live.update_with_return_pct(r_pct)
-    sigma_24h = live.sigma_horizon(24)
+    sigma_24h = model.sigma_horizon(24)
     if not pd.notna(sigma_24h) or not (sigma_24h > 0):
-        return live
+        return
 
-    ts_iso = bar_end.isoformat()
-    df_out = pd.DataFrame([{"timestamp": ts_iso, "garch_forecast": float(sigma_24h)}])
-    upsert_forecasts(df_out, db_path=DB_PATH, symbol=SYMBOL, timeframe=TIMEFRAME)
-    _keep_three_midnights_plus_latest_hourly(ts_iso)
-    _export_hourly_forecasts_json(
-        extra={
-            "mode": "live_garch11",
-            "horizon_steps": 24,
-            "forecast_interval_sec": HOURLY_FORECAST_INTERVAL_SEC,
-            "refit_interval_sec": HOURLY_REFIT_INTERVAL_SEC,
-        }
-    )
-
-    live.last_bar_end = bar_end
-    print(f"1h live: wrote 24h σ at {ts_iso} σ={sigma_24h:.6f}")
-    return live
-
-
-def _export_latest_10s_sigma_to_web() -> None:
-    export_forecasts_json(
-        db_path=DB_PATH,
-        out_path=WEB_FORECAST_10S_JSON,
+    df_out = pd.DataFrame([{"timestamp": midnight.isoformat(), "garch_forecast": float(sigma_24h)}])
+    upsert_forecasts(df_out, db_path=DB_PATH, symbol=SYMBOL, timeframe=DAILY_DB_TIMEFRAME)
+    keep_latest_n_forecasts(DB_PATH, symbol=SYMBOL, timeframe=DAILY_DB_TIMEFRAME, n=KEEP_LAST_N)
+    _export_forecasts_json(
+        out_path=WEB_FORECAST_24H_JSON,
         symbol=SYMBOL,
-        timeframe=TEN_SEC_DB_TIMEFRAME,
-        forecasts_newest_first=True,
+        timeframe=DAILY_DB_TIMEFRAME,
         extra={
-            "source_timeframe": "1s",
-            "bar_seconds": 10,
-            "garch_horizon_steps": 1,
-            "kept_forecasts": TEN_SEC_KEEP_ROWS,
-            "mode": "live_garch11",
-            "refit_interval_sec": TEN_SEC_REFIT_INTERVAL_SEC,
-            "boundary_delay_ms": TEN_SEC_BOUNDARY_DELAY_MS,
+            "source_timeframe": HOURLY_TIMEFRAME,
+            "horizon_steps": 24,
+            "run_time_utc": "00:00",
+            "kept_forecasts": KEEP_LAST_N,
         },
     )
+    print(f"24h@00:00: wrote {midnight.isoformat()} σ={float(sigma_24h):.6f}")
 
 
-def run_ten_second_live_forecast_tick(
-    live: LiveGarch11 | None,
-    *,
-    force_refit: bool,
-) -> LiveGarch11 | None:
-    """
-    Run one boundary-aligned live tick:
-      - refit occasionally (slow)
-      - update variance with newest closed 10s return (fast)
-      - write σ forecast for NEXT 10s bar to DB + JSON
-    """
-    now_utc = datetime.now(timezone.utc)
-    bar_end = floor_dt_to_step(now_utc, 10)
-
-    try:
-        bars_10s = fetch_recent_10s_bars(
-            symbol=SYMBOL, exchange_name="binance", limit_1s=TEN_SEC_FETCH_LIMIT_1S
-        )
-    except Exception as exc:
-        print(f"10s live tick: fetch failed: {exc}")
-        return live
-
-    if force_refit or live is None:
-        try:
-            live = LiveGarch11.fit_from_10s_bars(bars_10s)
-            # Seed last_bar_end so we don't immediately double-count the last bar.
-            if not bars_10s.empty:
-                last_ts = pd.to_datetime(bars_10s["timestamp"].iloc[-1], utc=True, errors="coerce")
-                if pd.notna(last_ts):
-                    live.last_bar_end = last_ts.to_pydatetime()
-            print("10s live: refit ok")
-        except Exception as exc:
-            print(f"10s live: refit failed: {exc}")
-            return None
-
-    if live.last_bar_end is not None and bar_end <= live.last_bar_end:
-        return live
-
-    rr = latest_closed_10s_return_pct(bars_10s, bar_end=bar_end)
-    if rr is None:
-        return live
-
-    r_pct, close_t = rr
-
-    sigma_next = live.update_with_return_pct(r_pct)
-    if not pd.notna(sigma_next) or not (sigma_next > 0):
-        return live
-
-    forecast_time = bar_end + timedelta(seconds=10)
-    df_out = pd.DataFrame(
-        [{"timestamp": forecast_time.isoformat(), "garch_forecast": float(sigma_next)}]
-    )
-    upserted = upsert_forecasts(
-        df_out,
-        db_path=DB_PATH,
-        symbol=SYMBOL,
-        timeframe=TEN_SEC_DB_TIMEFRAME,
-    )
-    keep_latest_n_forecasts(
-        DB_PATH, symbol=SYMBOL, timeframe=TEN_SEC_DB_TIMEFRAME, n=TEN_SEC_KEEP_ROWS
-    )
-    _export_latest_10s_sigma_to_web()
-
-    live.last_bar_end = bar_end
-    if upserted:
-        print(f"10s live: wrote forecast for {forecast_time.isoformat()} σ={sigma_next:.6f}")
-
-    # Remember what we just forecasted so we can score it once that bar closes.
-    setattr(live, "_prev_forecast_for", forecast_time)
-    setattr(live, "_prev_sigma_next", float(sigma_next))
-    setattr(live, "_prev_anchor_close", float(close_t))
-    return live
-
-
-def run_hourly_forecast_loop() -> None:
+def run_forecast_loop() -> None:
     init_forecasts_db(DB_PATH)
-    try:
-        backfill_hourly_midnights(days=HOURLY_BACKFILL_DAYS)
-    except Exception as exc:
-        print(f"Backfill: failed: {exc}")
-    try:
-        backfill_daily_24h_errors(days=DAILY_ERROR_BACKFILL_DAYS)
-    except Exception as exc:
-        print(f"24h backfill: failed: {exc}")
 
-    next_hourly_forecast = 0.0
-    last_hourly_refit_at = -1e18
-    next_10s_wall = datetime.now(timezone.utc)
-    last_refit_at = -1e18
-    live: LiveGarch11 | None = None
-    live_hourly: LiveGarch11 | None = None
-    last_daily_scored: datetime | None = None
+    last_minute_refit_at = -1e18
+    live_60s: LiveGarch11 | None = None
+
+    # Force a quick "catch up" run on startup (but still boundary aligned).
+    next_minute_wall = datetime.now(timezone.utc)
+    last_midnight_run: datetime | None = None
 
     while True:
         now_mono = time.monotonic()
         now_utc = datetime.now(timezone.utc)
 
-        # Boundary-aligned 10s tick (run shortly after each 10s boundary).
-        if now_utc >= next_10s_wall:
-            force_refit = (now_mono - last_refit_at) >= TEN_SEC_REFIT_INTERVAL_SEC
-            live = run_ten_second_live_forecast_tick(live, force_refit=force_refit)
-            if force_refit and live is not None:
-                last_refit_at = now_mono
-            # schedule next boundary tick
-            next_boundary = next_10s_boundary_utc(now_utc)
-            next_10s_wall = next_boundary + timedelta(milliseconds=TEN_SEC_BOUNDARY_DELAY_MS)
+        # 60s cadence: run shortly after each minute boundary.
+        if now_utc >= next_minute_wall:
+            force_refit = (now_mono - last_minute_refit_at) >= MINUTE_REFIT_INTERVAL_SEC
+            live_60s = run_minute_60s_forecast_tick(live_60s, force_refit=force_refit)
+            if force_refit and live_60s is not None:
+                last_minute_refit_at = now_mono
+            next_boundary = _next_boundary_utc(now_utc, step_seconds=MINUTE_STEP_SECONDS)
+            next_minute_wall = next_boundary + timedelta(milliseconds=MINUTE_BOUNDARY_DELAY_MS)
 
-        if now_mono >= next_hourly_forecast:
-            force_refit_hourly = (now_mono - last_hourly_refit_at) >= HOURLY_REFIT_INTERVAL_SEC
-            live_hourly = run_hourly_live_forecast_tick(
-                live_hourly, force_refit=force_refit_hourly
-            )
-            if force_refit_hourly and live_hourly is not None:
-                last_hourly_refit_at = now_mono
-            next_hourly_forecast = now_mono + HOURLY_FORECAST_INTERVAL_SEC
-
-        # Daily scoring of yesterday's 24h band (runs after 00:00 UTC).
-        try:
-            last_daily_scored = run_daily_24h_error_tick(last_scored_day=last_daily_scored)
-        except Exception as exc:
-            print(f"24h daily error tick failed: {exc}")
+        # Midnight-only 24h horizon: run once per day.
+        midnight = floor_dt_to_step(now_utc, 24 * 60 * 60)
+        if last_midnight_run is None or midnight > last_midnight_run:
+            before = last_midnight_run
+            run_daily_midnight_24h_forecast()
+            # If we were past the delay window, treat as completed for this midnight.
+            if datetime.now(timezone.utc) >= midnight + timedelta(milliseconds=DAILY_MIDNIGHT_DELAY_MS):
+                last_midnight_run = midnight
+            else:
+                last_midnight_run = before
 
         # Sleep until next scheduled event (cap to stay responsive).
-        sleep_to_hourly = max(0.0, next_hourly_forecast - time.monotonic())
-        sleep_to_10s = max(0.0, (next_10s_wall - datetime.now(timezone.utc)).total_seconds())
-        sleep_for = min(sleep_to_hourly, sleep_to_10s, 15.0)
-        if sleep_for > 0:
-            time.sleep(sleep_for)
+        sleep_to_minute = max(0.0, (next_minute_wall - datetime.now(timezone.utc)).total_seconds())
+        # Ensure we wake up around midnight even if minute timer is far.
+        next_midnight = midnight + timedelta(days=1)
+        sleep_to_midnight = max(
+            0.0,
+            (
+                next_midnight
+                + timedelta(milliseconds=DAILY_MIDNIGHT_DELAY_MS)
+                - datetime.now(timezone.utc)
+            ).total_seconds(),
+        )
+        time.sleep(min(sleep_to_minute, sleep_to_midnight, 10.0))
 
 
 def main() -> None:
-    run_hourly_forecast_loop()
+    run_forecast_loop()
 
 
 if __name__ == "__main__":

@@ -44,16 +44,15 @@ Default local base: `http://127.0.0.1:8000`
 - `GET /` (root): `http://127.0.0.1:8000/`
 - `GET /health`: `http://127.0.0.1:8000/health`
 - `GET /forecasts`:
-  - Example (hourly): `http://127.0.0.1:8000/forecasts?symbol=BTC%2FUSDT&timeframe=1h`
-  - Example (10s, newest-first): `http://127.0.0.1:8000/forecasts?symbol=BTC%2FUSDT&timeframe=10s&newest_first=true&limit=6`
-- `GET /errors`:
-  - Example (10s): `http://127.0.0.1:8000/errors?symbol=BTC%2FUSDT&series=10s&limit=30`
-  - Example (24h): `http://127.0.0.1:8000/errors?symbol=BTC%2FUSDT&series=24h&limit=30`
+  - Example (live 60s band): `http://127.0.0.1:8000/forecasts?symbol=BTC%2FUSDT&timeframe=5s_60s&newest_first=true&limit=30`
+  - Example (daily 24h-at-midnight): `http://127.0.0.1:8000/forecasts?symbol=BTC%2FUSDT&timeframe=1h_24h_at_00utc&newest_first=false&limit=120`
+- `GET /market/daily`:
+  - Example (7d candles): `http://127.0.0.1:8000/market/daily?symbol=BTCUSDT&days=7`
 
 ### Backend WebSocket (consumed by frontend)
 
-- `WS /ws/price` (query params: `symbol`, `min_interval_ms`):
-  - Example (local): `ws://127.0.0.1:8000/ws/price?symbol=btcusdt&min_interval_ms=500`
+- `WS /ws/price` (query params: `symbol`, `interval_ms`):
+  - Example (local): `ws://127.0.0.1:8000/ws/price?symbol=btcusdt&interval_ms=1000`
 
 ### Frontend-configured API base
 
@@ -70,8 +69,8 @@ This runs:
 
 Generated artifacts:
 - `data/forecasts.db` (SQLite)
-- `web/public/forecasts.json`
-- `web/public/forecasts_10s.json`
+- `web/public/forecasts_60s.json`
+- `web/public/forecasts_24h.json`
 
 Run:
 

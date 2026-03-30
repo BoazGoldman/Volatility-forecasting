@@ -1,51 +1,26 @@
+import ApexCharts from "apexcharts";
+import type { ApexAxisChartSeries } from "apexcharts";
 import type { SavedForecast } from "./liveForecast10sChart";
 
-/** Pixel height for 7d chart canvas (must match layout). */
-const MAIN_CHART_HEIGHT = 320;
+export type DailyPoint = { open_time: number; close: number | null; label?: string };
 
-/** GARCH ±σ columns, vertical range ticks, and forecast spokes (matches legend). */
-const CHART_RANGE = "#FFFFFF";
-/** Price path (7d line). */
-const CHART_PRICE_LINE = "#5E97F6";
-/** Square/circle markers on price and range bounds. */
-const CHART_DOT_7D = CHART_PRICE_LINE;
-
-const canvas7d = document.getElementById("chart-7d") as HTMLCanvasElement | null;
-const ctx7d = canvas7d?.getContext("2d") ?? null;
 const chart7dLowEl = document.getElementById("chart-7d-low");
 const chart7dHighEl = document.getElementById("chart-7d-high");
-
-export type DailyPoint = { open_time: number; close: number | null; label?: string };
 
 const MS_PER_DAY = 86_400_000;
 
 export function dailyPointsFromApi(apiPoints: { open_time: number; close: number }[]): DailyPoint[] {
   if (apiPoints.length === 0) return [];
-  const normalized: DailyPoint[] = apiPoints.map((p) => ({
+  const sorted = [...apiPoints].sort((a, b) => a.open_time - b.open_time);
+  const normalized: DailyPoint[] = sorted.map((p) => ({
     open_time: p.open_time,
     close: p.close,
   }));
-  const last = apiPoints[apiPoints.length - 1];
+  const last = sorted[sorted.length - 1];
   const tTomorrow = last.open_time + MS_PER_DAY;
   const d = new Date(tTomorrow);
   const label = `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
   return [...normalized, { open_time: tTomorrow, close: null, label }];
-}
-
-/** Start stroke slightly past the last-real dot so lines do not visually cut through it. */
-function lineStartAfterDot(
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
-  dotRadius: number,
-): [number, number] {
-  const dx = x1 - x0;
-  const dy = y1 - y0;
-  const len = Math.hypot(dx, dy);
-  if (len < 1e-6) return [x0, y0];
-  const t = Math.min((dotRadius + 1) / len, 1);
-  return [x0 + dx * t, y0 + dy * t];
 }
 
 export function dateKeyUtc(ms: number): string {
@@ -56,263 +31,380 @@ export function splitForecastRows(forecasts: SavedForecast[]): {
   latest: SavedForecast | null;
   historicalMidnights: SavedForecast[];
 } {
-  if (forecasts.length === 0) {
-    return { latest: null, historicalMidnights: [] };
-  }
-
+  if (forecasts.length === 0) return { latest: null, historicalMidnights: [] };
   const sorted = [...forecasts].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
   const latest = sorted[sorted.length - 1];
   const midnightRows = sorted.filter((f) => {
     const t = new Date(f.timestamp);
     return t.getUTCHours() === 0 && t.getUTCMinutes() === 0 && t.getUTCSeconds() === 0;
   });
-
-  /*
-   * Last up to 3 UTC midnights as column overlays (each σ is drawn on that calendar day).
-   * Do not use slice(-3,-1): that dropped the newest midnight (e.g. Mar 24) so its band
-   * never appeared on that day — only “tomorrow” used latest.
-   */
-  const historicalMidnights =
-    midnightRows.length >= 3 ? midnightRows.slice(-3) : midnightRows.slice();
-
+  const historicalMidnights = midnightRows.length >= 3 ? midnightRows.slice(-3) : midnightRows.slice();
   return { latest, historicalMidnights };
 }
 
 export function layoutChart7dCanvas() {
-  if (!canvas7d) return;
-  const panel = canvas7d.closest(".chart-panel");
-  const raw = panel ? panel.clientWidth - 8 : canvas7d.clientWidth || 720;
-  const w = Math.max(260, Math.min(Math.floor(raw), 1600));
-  canvas7d.width = w;
-  canvas7d.height = MAIN_CHART_HEIGHT;
+  // ApexCharts is responsive; kept for call sites.
+}
+
+let chart7d: ApexCharts | null = null;
+let chart7dEl: HTMLElement | null = null;
+let chart7dReady = false;
+let pendingDraw: { points: DailyPoint[]; forecasts: SavedForecast[] } | null = null;
+
+export function resizeSevenDayChart() {
+  if (!chart7d || !chart7dReady) return;
+  const anyChart = chart7d as unknown as { resize?: () => void };
+  try {
+    anyChart.resize?.();
+  } catch {
+    // ignore
+  }
+}
+
+function formatYLabel2(v: unknown): string {
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n)) return "";
+  return n.toFixed(2);
+}
+
+function formatDateUtcShort(ms: number): string {
+  const d = new Date(ms);
+  if (!Number.isFinite(d.getTime())) return "";
+  const month = d.toLocaleString(undefined, { month: "short", timeZone: "UTC" });
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${month} ${day} (UTC)`;
+}
+
+function nearestCloseFromSeries(w: any, x: number): { x: number; y: number } | null {
+  const s0 = w?.config?.series?.[0]?.data;
+  if (!Array.isArray(s0) || s0.length === 0) return null;
+  let best: { x: number; y: number } | null = null;
+  let bestDist = Infinity;
+  for (const pt of s0) {
+    const px = typeof pt?.x === "number" ? pt.x : Number(pt?.x);
+    const py = typeof pt?.y === "number" ? pt.y : Number(pt?.y);
+    if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+    const d = Math.abs(px - x);
+    if (d < bestDist) {
+      bestDist = d;
+      best = { x: px, y: py };
+    }
+  }
+  return best;
+}
+
+function safeMinMax(nums: number[]): { min: number; max: number } | null {
+  const xs = nums.filter((n) => Number.isFinite(n));
+  if (xs.length === 0) return null;
+  return { min: Math.min(...xs), max: Math.max(...xs) };
+}
+
+function ensure7dChart(): ApexCharts | null {
+  if (chart7d && chart7dEl && document.body.contains(chart7dEl)) return chart7d;
+  chart7dReady = false;
+  chart7d?.destroy();
+  chart7d = null;
+
+  const el = document.getElementById("chart-7d");
+  if (!el) return null;
+  chart7dEl = el;
+
+  const options: ApexCharts.ApexOptions = {
+    chart: {
+      type: "line",
+      height: "100%",
+      animations: { enabled: false },
+      background: "#0d1429",
+      toolbar: { show: false },
+      zoom: { enabled: false },
+      foreColor: "#9eabc9",
+    },
+    grid: {
+      borderColor: "#253055",
+      padding: { left: 8, right: 8, top: 6, bottom: 6 },
+    },
+    legend: { show: false },
+    dataLabels: { enabled: false },
+    markers: {
+      size: 3,
+      strokeWidth: 0,
+      hover: { size: 5 },
+    },
+    xaxis: {
+      type: "datetime",
+      labels: { datetimeUTC: true },
+      axisBorder: { show: false },
+      axisTicks: { show: false },
+    },
+    // Use array form to match later updates.
+    yaxis: [
+      {
+        decimalsInFloat: 2,
+        tickAmount: 9,
+        labels: { formatter: formatYLabel2 },
+      },
+    ],
+    tooltip: {
+      theme: "dark",
+      custom: ({ seriesIndex, dataPointIndex, w }: any) => {
+        const sx = w?.globals?.seriesX?.[seriesIndex]?.[dataPointIndex];
+        const x = typeof sx === "number" ? sx : Number(sx);
+        const close = Number.isFinite(x) ? nearestCloseFromSeries(w, x) : null;
+        const dateLabel = close ? formatDateUtcShort(close.x) : Number.isFinite(x) ? formatDateUtcShort(x) : "";
+        const closeLabel = close ? close.y.toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—";
+        return `
+          <div class="apexcharts-tooltip-title">${dateLabel}</div>
+          <div class="apexcharts-tooltip-series-group apexcharts-active" style="display:flex;">
+            <span class="apexcharts-tooltip-marker" style="background-color:#5E97F6;"></span>
+            <div class="apexcharts-tooltip-text">
+              <div class="apexcharts-tooltip-y-group">
+                <span class="apexcharts-tooltip-text-y-label">Close: </span>
+                <span class="apexcharts-tooltip-text-y-value">${closeLabel}</span>
+              </div>
+            </div>
+          </div>
+        `;
+      },
+    },
+    stroke: { curve: "straight", width: 2 },
+    fill: { type: "solid", opacity: 1 },
+    series: [],
+  };
+
+  chart7d = new ApexCharts(el, options);
+  void chart7d.render().then(() => {
+    chart7dReady = true;
+    const p = pendingDraw;
+    if (p) {
+      pendingDraw = null;
+      // Draw on next frame so layout is stable.
+      requestAnimationFrame(() => drawSevenDayChart(p.points, p.forecasts));
+    }
+  });
+  return chart7d;
+}
+
+type BandBox = { x0: number; x1: number; lo: number; hi: number; startLo: number; startHi: number };
+
+function buildBandBoxes(points: DailyPoint[], forecasts: SavedForecast[]): BandBox[] {
+  if (forecasts.length === 0 || points.length === 0) return [];
+  const { latest, historicalMidnights } = splitForecastRows(forecasts);
+  const boxes: BandBox[] = [];
+
+  const push = (x0: number, x1: number, low: number, high: number, startLow?: number, startHigh?: number) => {
+    if (!Number.isFinite(x0) || !Number.isFinite(x1) || !Number.isFinite(low) || !Number.isFinite(high)) return;
+    const lo = Math.min(low, high);
+    const hi = Math.max(low, high);
+    const sLo = startLow !== undefined && Number.isFinite(startLow) ? startLow : lo;
+    const sHi = startHigh !== undefined && Number.isFinite(startHigh) ? startHigh : hi;
+    boxes.push({ x0, x1, lo, hi, startLo: sLo, startHi: sHi });
+  };
+
+  for (const fp of historicalMidnights) {
+    const ts = Date.parse(fp.timestamp);
+    if (!Number.isFinite(ts)) continue;
+    const k = dateKeyUtc(ts);
+    const idx = points.findIndex((p) => p.close !== null && dateKeyUtc(p.open_time) === k);
+    // Forecast at day D 00:00 applies to day D move, anchored on day D-1 close.
+    if (idx <= 0) continue;
+    const baseClose = points[idx - 1].close as number;
+    if (!Number.isFinite(baseClose)) continue;
+    const sigma = Math.max(fp.garch_forecast, 0);
+    // Historical: keep as a day-sized box on day D.
+    push(points[idx].open_time, points[idx].open_time + MS_PER_DAY, baseClose * (1 - sigma), baseClose * (1 + sigma));
+  }
+
+  // Latest/current forecast: prefer to place it on the last real day slot (today),
+  // anchored on yesterday's close. If we can't match it to a real day, fall back
+  // to the synthetic "tomorrow" slot.
+  if (latest) {
+    const ts = Date.parse(latest.timestamp);
+    const k = Number.isFinite(ts) ? dateKeyUtc(ts) : null;
+    const idx = k ? points.findIndex((p) => p.close !== null && dateKeyUtc(p.open_time) === k) : -1;
+    if (idx > 0) {
+      const baseClose = points[idx - 1].close as number;
+      if (Number.isFinite(baseClose)) {
+        const sigma = Math.max(latest.garch_forecast, 0);
+        // Latest (today): draw a forward "tunnel" centered on *yesterday's close*,
+        // spanning the previous slot (yesterday) through the next slot (tomorrow).
+        const x0 = points[idx - 1].open_time;
+        const x1 = points[idx].open_time + MS_PER_DAY;
+        push(x0, x1, baseClose * (1 - sigma), baseClose * (1 + sigma), baseClose * (1 - sigma), baseClose * (1 + sigma));
+      }
+    } else {
+      const futureIdx = points.findIndex((p) => p.close === null);
+      const lastReal = [...points].reverse().find((p) => p.close !== null)?.close ?? null;
+      if (futureIdx >= 0 && lastReal !== null && Number.isFinite(lastReal)) {
+        const sigma = Math.max(latest.garch_forecast, 0);
+        // Fallback: if we can't match "today", place a day-sized box at the future slot.
+        push(
+          points[futureIdx].open_time,
+          points[futureIdx].open_time + MS_PER_DAY,
+          lastReal * (1 - sigma),
+          lastReal * (1 + sigma),
+        );
+      }
+    }
+  }
+
+  return boxes;
 }
 
 export function drawSevenDayChart(points: DailyPoint[], lastSavedForecasts: SavedForecast[]) {
-  if (!canvas7d || !ctx7d) return;
-  const width = canvas7d.width;
-  const height = canvas7d.height;
-  const padTop = 22;
-  const padLeft = 14;
-  const padRight = 14;
-  const bottomPad = 48;
-
-  ctx7d.clearRect(0, 0, width, height);
-  ctx7d.fillStyle = "#0d1429";
-  ctx7d.fillRect(0, 0, width, height);
-
-  ctx7d.strokeStyle = "#253055";
-  ctx7d.lineWidth = 1;
-  for (let i = 0; i < 4; i += 1) {
-    const y = padTop + ((height - padTop - bottomPad) * i) / 3;
-    ctx7d.beginPath();
-    ctx7d.moveTo(padLeft, y);
-    ctx7d.lineTo(width - padRight, y);
-    ctx7d.stroke();
-  }
-
-  const realCloses = points.map((p) => p.close).filter((c): c is number => c !== null && Number.isFinite(c));
-
-  if (realCloses.length === 0) {
-    ctx7d.fillStyle = "#9eabc9";
-    ctx7d.font = "13px Segoe UI";
-    ctx7d.fillText("No daily data yet.", padLeft + 8, height / 2);
-    if (chart7dLowEl) chart7dLowEl.textContent = "—";
-    if (chart7dHighEl) chart7dHighEl.textContent = "—";
+  const chart = ensure7dChart();
+  if (!chart) return;
+  if (!chart7dReady) {
+    pendingDraw = { points, forecasts: lastSavedForecasts };
     return;
   }
 
-  let minP = Math.min(...realCloses);
-  let maxP = Math.max(...realCloses);
+  const closes = points
+    .filter((p) => p.close !== null && Number.isFinite(p.close))
+    .map((p) => ({ x: p.open_time, y: p.close as number }))
+    .sort((a, b) => a.x - b.x);
 
-  // Expand Y-scale so forecast ranges are visible on the same chart.
-  if (lastSavedForecasts.length > 0) {
-    const { latest, historicalMidnights } = splitForecastRows(lastSavedForecasts);
+  const boxes = buildBandBoxes(points, lastSavedForecasts);
 
-    historicalMidnights.forEach((fp) => {
-      const ts = Date.parse(fp.timestamp);
-      if (!Number.isFinite(ts)) return;
-      const k = dateKeyUtc(ts);
-      const idx = points.findIndex((p) => p.close !== null && dateKeyUtc(p.open_time) === k);
-      if (idx <= 0) return;
-      const baseClose = points[idx - 1].close as number;
-      const sigma = Math.max(fp.garch_forecast, 0);
-      const low = baseClose * (1 - sigma);
-      const high = baseClose * (1 + sigma);
-      minP = Math.min(minP, low);
-      maxP = Math.max(maxP, high);
-    });
+  const lastCloseMarker =
+    closes.length > 0
+      ? [
+          {
+            seriesIndex: 0,
+            dataPointIndex: closes.length - 1,
+            size: 6,
+            fillColor: "#5E97F6",
+            strokeColor: "#FFFFFF",
+            strokeWidth: 2,
+            shape: "circle",
+          },
+        ]
+      : [];
 
-    const lastRealClose = [...points].reverse().find((p) => p.close !== null)?.close ?? null;
-    if (latest && lastRealClose !== null && Number.isFinite(lastRealClose)) {
-      const sigma = Math.max(latest.garch_forecast, 0);
-      const low = lastRealClose * (1 - sigma);
-      const high = lastRealClose * (1 + sigma);
-      minP = Math.min(minP, low);
-      maxP = Math.max(maxP, high);
-    }
+  // "Camera" framing: show the entire 7d window (including the full last day),
+  // and include any forecast-band boxes.
+  const xCandidates: number[] = [];
+  for (const p of points) if (Number.isFinite(p.open_time)) xCandidates.push(p.open_time);
+  for (const c of closes) if (Number.isFinite(c.x)) xCandidates.push(c.x);
+  for (const b of boxes) {
+    if (Number.isFinite(b.x0)) xCandidates.push(b.x0);
+    if (Number.isFinite(b.x1)) xCandidates.push(b.x1);
   }
 
-  const padPct = 0.03;
-  const padAbs = Math.max((maxP - minP) * padPct, 0.000001);
-  minP -= padAbs;
-  maxP += padAbs;
-  const range = Math.max(maxP - minP, 0.000001);
-  const plotH = height - padTop - bottomPad;
-  const plotW = width - padLeft - padRight;
-  const lastIdx = Math.max(points.length - 1, 0);
-  const rightXGutterSteps = 0.14;
-  const xSpan = Math.max(lastIdx + rightXGutterSteps, 1e-6);
-  const xAt = (i: number) => padLeft + (plotW * i) / xSpan;
-  const yAt = (close: number) => padTop + plotH - ((close - minP) / range) * plotH;
+  let xMin = xCandidates.length > 0 ? Math.min(...xCandidates) : undefined;
+  let xMax = xCandidates.length > 0 ? Math.max(...xCandidates) : undefined;
 
-  /* Line only across real closes (stops before future slot) */
-  ctx7d.beginPath();
-  ctx7d.lineWidth = 2;
-  ctx7d.strokeStyle = CHART_PRICE_LINE;
-  let started = false;
-  points.forEach((p, i) => {
-    if (p.close === null) {
-      started = false;
-      return;
-    }
-    const x = xAt(i);
-    const y = yAt(p.close);
-    if (!started) {
-      ctx7d.moveTo(x, y);
-      started = true;
-    } else {
-      ctx7d.lineTo(x, y);
-    }
-  });
-  ctx7d.stroke();
+  // If the max x corresponds to a day open, extend to end-of-day so the last day is fully visible.
+  if (xMax !== undefined) xMax += MS_PER_DAY;
 
-  /* Overlay saved forecasts: recent midnights on matching dates + latest range on tomorrow. */
-  if (lastSavedForecasts.length > 0) {
-    const { latest, historicalMidnights } = splitForecastRows(lastSavedForecasts);
-
-    historicalMidnights.forEach((fp) => {
-      const ts = Date.parse(fp.timestamp);
-      if (!Number.isFinite(ts)) return;
-      const k = dateKeyUtc(ts);
-      const idx = points.findIndex((p) => p.close !== null && dateKeyUtc(p.open_time) === k);
-      if (idx <= 0) return;
-      const baseClose = points[idx - 1].close as number;
-      const sigma = Math.max(fp.garch_forecast, 0);
-      const low = baseClose * (1 - sigma);
-      const high = baseClose * (1 + sigma);
-      const x = xAt(idx);
-      const yLow = yAt(low);
-      const yHigh = yAt(high);
-
-      ctx7d.save();
-      ctx7d.strokeStyle = CHART_RANGE;
-      ctx7d.lineWidth = 2;
-      ctx7d.setLineDash([4, 4]);
-      ctx7d.beginPath();
-      ctx7d.moveTo(x, yLow);
-      ctx7d.lineTo(x, yHigh);
-      ctx7d.stroke();
-      ctx7d.setLineDash([]);
-      ctx7d.fillStyle = CHART_RANGE;
-      ctx7d.beginPath();
-      ctx7d.arc(x, yLow, 3, 0, Math.PI * 2);
-      ctx7d.fill();
-      ctx7d.beginPath();
-      ctx7d.arc(x, yHigh, 3, 0, Math.PI * 2);
-      ctx7d.fill();
-      ctx7d.restore();
-    });
-
-    const futureIdx = points.findIndex((p) => p.close === null);
-    const lastRealIdx = (() => {
-      for (let i = points.length - 1; i >= 0; i -= 1) {
-        if (points[i].close !== null) return i;
-      }
-      return -1;
-    })();
-    const lastReal = lastRealIdx >= 0 ? (points[lastRealIdx].close as number) : null;
-
-    if (latest && futureIdx >= 0 && lastReal !== null && Number.isFinite(lastReal)) {
-      const sigma = Math.max(latest.garch_forecast, 0);
-      const low = lastReal * (1 - sigma);
-      const high = lastReal * (1 + sigma);
-      const x = xAt(futureIdx);
-      const yLow = yAt(low);
-      const yHigh = yAt(high);
-      const xNow = xAt(lastRealIdx);
-      const yNow = yAt(lastReal);
-      const yellowDotR = 3.5;
-      const [sxLow, syLow] = lineStartAfterDot(xNow, yNow, x, yLow, yellowDotR);
-      const [sxHigh, syHigh] = lineStartAfterDot(xNow, yNow, x, yHigh, yellowDotR);
-
-      ctx7d.save();
-      ctx7d.strokeStyle = CHART_RANGE;
-      ctx7d.lineWidth = 2;
-      ctx7d.setLineDash([4, 4]);
-      ctx7d.beginPath();
-      ctx7d.moveTo(sxLow, syLow);
-      ctx7d.lineTo(x, yLow);
-      ctx7d.stroke();
-      ctx7d.beginPath();
-      ctx7d.moveTo(sxHigh, syHigh);
-      ctx7d.lineTo(x, yHigh);
-      ctx7d.stroke();
-      ctx7d.setLineDash([]);
-      ctx7d.fillStyle = CHART_RANGE;
-      ctx7d.beginPath();
-      ctx7d.arc(x, yLow, 3, 0, Math.PI * 2);
-      ctx7d.fill();
-      ctx7d.beginPath();
-      ctx7d.arc(x, yHigh, 3, 0, Math.PI * 2);
-      ctx7d.fill();
-      ctx7d.restore();
-    }
+  // Small padding so the first/last day isn't flush against the frame.
+  if (xMin !== undefined && xMax !== undefined && xMax > xMin) {
+    const padX = Math.max((xMax - xMin) * 0.02, MS_PER_DAY * 0.05);
+    xMin -= padX;
+    xMax += padX;
   }
 
-  /* Dots on real days (drawn last so ranges don't cover them) */
-  points.forEach((p, i) => {
-    if (p.close === null) return;
-    const x = xAt(i);
-    const y = yAt(p.close);
-    ctx7d.save();
-    ctx7d.shadowBlur = 10;
-    ctx7d.shadowColor = "rgba(214, 236, 255, 0.95)";
-    ctx7d.beginPath();
-    ctx7d.fillStyle = CHART_DOT_7D;
-    ctx7d.arc(x, y, 4.4, 0, Math.PI * 2);
-    ctx7d.fill();
-    ctx7d.shadowBlur = 0;
-    ctx7d.lineWidth = 2;
-    ctx7d.strokeStyle = "rgba(13, 20, 41, 0.95)";
-    ctx7d.stroke();
-    ctx7d.restore();
+  // Y scale: fit the entire plotted graph in the camera view (closes + ALL band boxes).
+  const closeYs = closes.map((c) => c.y);
+  const yCandidates: number[] = [...closeYs];
+  for (const b of boxes) yCandidates.push(b.lo, b.hi);
+  const mm = safeMinMax(yCandidates);
+
+  // Build series: one close line + ONE rangeArea series per band box.
+  const series: ApexAxisChartSeries = [];
+  series.push({ name: "Close", type: "line", data: closes } as any);
+  boxes.forEach((b, i) => {
+    series.push(
+      {
+        name: `Band ${i + 1}`,
+        type: "rangeArea",
+        data: [
+          { x: b.x0, y: [b.startLo, b.startHi] },
+          { x: b.x1, y: [b.lo, b.hi] },
+        ],
+      } as any,
+    );
   });
 
-  if (chart7dLowEl) {
-    chart7dLowEl.textContent = minP.toLocaleString(undefined, { maximumFractionDigits: 0 });
-  }
-  if (chart7dHighEl) {
-    chart7dHighEl.textContent = maxP.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  const colors = ["#5E97F6", ...boxes.map(() => "#FFFFFF")];
+  const strokeWidths = [2, ...boxes.map(() => 1)];
+  const fillOpacities = [1, ...boxes.map(() => 0.14)];
+
+  if (mm) {
+    // Hard "camera" range requested: show the full 53k..73k window.
+    // If data exceeds that window, expand to include everything.
+    const targetMin = 53_000;
+    const targetMax = 73_000;
+    const yMin = Math.min(targetMin, mm.min);
+    const yMax = Math.max(targetMax, mm.max);
+    if (chart7dLowEl) chart7dLowEl.textContent = yMin.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    if (chart7dHighEl) chart7dHighEl.textContent = yMax.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    void chart.updateOptions(
+      {
+        colors,
+        stroke: { curve: "straight", width: strokeWidths },
+        fill: { type: "solid", opacity: fillOpacities },
+        markers: {
+          size: 3,
+          strokeWidth: 0,
+          hover: { size: 5 },
+          discrete: lastCloseMarker as any,
+        },
+        xaxis: {
+          min: xMin,
+          max: xMax,
+          type: "datetime",
+          labels: { datetimeUTC: true },
+          axisBorder: { show: false },
+          axisTicks: { show: false },
+        },
+        // Use array form so Apex applies bounds reliably with multi-series.
+        yaxis: [
+          {
+            min: yMin,
+            max: yMax,
+            decimalsInFloat: 2,
+            tickAmount: 9,
+            forceNiceScale: false,
+            labels: { formatter: formatYLabel2 },
+          },
+        ],
+      },
+      true,
+      false,
+    );
+  } else {
+    if (chart7dLowEl) chart7dLowEl.textContent = "—";
+    if (chart7dHighEl) chart7dHighEl.textContent = "—";
+    void chart.updateOptions(
+      {
+        colors,
+        stroke: { curve: "straight", width: strokeWidths },
+        fill: { type: "solid", opacity: fillOpacities },
+        markers: {
+          size: 3,
+          strokeWidth: 0,
+          hover: { size: 5 },
+          discrete: lastCloseMarker as any,
+        },
+        xaxis: {
+          min: xMin,
+          max: xMax,
+          type: "datetime",
+          labels: { datetimeUTC: true },
+          axisBorder: { show: false },
+          axisTicks: { show: false },
+        },
+        yaxis: [
+          {
+            decimalsInFloat: 2,
+            labels: { formatter: formatYLabel2 },
+          },
+        ],
+      },
+      true,
+      false,
+    );
   }
 
-  ctx7d.fillStyle = "#9eabc9";
-  ctx7d.font = width < 420 ? "9px Segoe UI" : "10px Segoe UI";
-  points.forEach((p, i) => {
-    const x = xAt(i);
-    let label: string;
-    if (p.label) {
-      label = p.label;
-    } else {
-      const d = new Date(p.open_time);
-      // Use UTC to match Binance daily candle boundaries (00:00 UTC).
-      label = `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
-    }
-    const w = ctx7d.measureText(label).width;
-    const minX = padLeft;
-    const maxX = width - padRight - w;
-    let tx = x - w / 2;
-    if (tx < minX) tx = minX;
-    if (tx > maxX) tx = maxX;
-    ctx7d.fillText(label, tx, height - 18);
-  });
+  void chart.updateSeries(series as any, false);
 }
