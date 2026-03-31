@@ -183,6 +183,7 @@ def root() -> dict[str, Any]:
             "health": "/health",
             "forecasts": "/forecasts?symbol=BTC/USDT&timeframe=5s_60s&limit=30&newest_first=true",
             "daily_prices": "/market/daily?symbol=BTCUSDT&days=7",
+            "hourly_prices": "/market/hourly?symbol=BTCUSDT&hours=24",
             "ws_price": "/ws/price?symbol=btcusdt&interval_ms=1000",
             "docs": "/docs",
         },
@@ -200,6 +201,10 @@ def get_forecasts(
     timeframe: str = Query(default="5s_60s", description="Forecast timeframe key, e.g. 5s_60s"),
     limit: int | None = Query(default=120, ge=1, le=2000),
     newest_first: bool = Query(default=True),
+    include_delta_to_latest: bool = Query(
+        default=False,
+        description="If true, include delta_to_latest (row sigma - latest sigma) for returned rows.",
+    ),
 ) -> dict[str, Any]:
     """
     Reads forecast rows from the local SQLite DB and returns the JSON shape the frontend expects.
@@ -228,10 +233,24 @@ def get_forecasts(
             except Exception:
                 continue
 
+    latest_sigma: float | None = None
+    if include_delta_to_latest and out:
+        latest_row = max(out, key=lambda r: str(r.get("timestamp", "")))
+        latest_raw = latest_row.get("garch_forecast")
+        latest_sigma = float(latest_raw) if latest_raw is not None else None
+        if latest_sigma is not None and latest_sigma == latest_sigma:  # NaN-safe check
+            for row in out:
+                sigma = row.get("garch_forecast")
+                try:
+                    row["delta_to_latest"] = float(sigma) - float(latest_sigma)
+                except Exception:
+                    row["delta_to_latest"] = None
+
     return {
         "symbol": symbol,
         "timeframe": timeframe,
         "updated_at": datetime.now(timezone.utc).isoformat(),
+        "latest_garch_forecast": latest_sigma if include_delta_to_latest else None,
         "forecasts": out,
     }
 
@@ -281,6 +300,44 @@ async def get_daily_prices(
         "symbol": symbol.upper(),
         "interval": "1d",
         "days": days,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "candles": out,
+    }
+
+
+@app.get("/market/hourly")
+async def get_hourly_prices(
+    symbol: str = Query(default="BTCUSDT", description="Binance symbol, e.g. BTCUSDT"),
+    hours: int = Query(default=24, ge=1, le=240),
+) -> dict[str, Any]:
+    """
+    Returns the last N hourly candles (1h) and hourly closes.
+    Intended for the "last 24 hours" graph.
+    """
+    try:
+        klines = await asyncio.to_thread(_fetch_binance_klines, symbol=symbol, interval="1h", limit=hours)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Binance fetch failed: {exc}")
+
+    out: list[dict[str, Any]] = []
+    for k in klines:
+        if not isinstance(k, list) or len(k) < 7:
+            continue
+        open_time_ms = int(k[0])
+        close_price = float(k[4])
+        close_time_ms = int(k[6])
+        out.append(
+            {
+                "open_time": datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc).isoformat(),
+                "close_time": datetime.fromtimestamp(close_time_ms / 1000, tz=timezone.utc).isoformat(),
+                "close": close_price,
+            }
+        )
+
+    return {
+        "symbol": symbol.upper(),
+        "interval": "1h",
+        "hours": hours,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "candles": out,
     }

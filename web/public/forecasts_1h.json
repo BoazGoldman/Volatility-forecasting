@@ -1,0 +1,33 @@
+{
+  "symbol": "BTC/USDT",
+  "timeframe": "5m_1h",
+  "updated_at": "2026-03-31T20:20:06.166108+00:00",
+  "forecasts": [
+    {
+      "timestamp": "2026-03-31T17:00:00+00:00",
+      "garch_forecast": 0.010083281228781407
+    },
+    {
+      "timestamp": "2026-03-31T18:00:00+00:00",
+      "garch_forecast": 0.010083281228781407
+    },
+    {
+      "timestamp": "2026-03-31T19:00:00+00:00",
+      "garch_forecast": 0.010083281228781407
+    },
+    {
+      "timestamp": "2026-03-31T20:00:00+00:00",
+      "garch_forecast": 0.005038547535528475
+    },
+    {
+      "timestamp": "2026-03-31T20:25:00+00:00",
+      "garch_forecast": 0.005038547535528475
+    }
+  ],
+  "source_timeframe": "5m",
+  "horizon_steps": 12,
+  "horizon_minutes": 60,
+  "cadence_seconds": 300,
+  "kept_forecasts": 30,
+  "refit_interval_sec": 28800
+}

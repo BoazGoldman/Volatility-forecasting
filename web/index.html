@@ -11,56 +11,69 @@
     <section class="dashboard">
       <header class="dashboard-header">
         <div>
-          <p class="eyebrow">Volatility Forecasting</p>
-          <h1>Goldmans Sandbox</h1>
+          <p class="eyebrow">Goldmans Sandbox</p>
+          <h1>Volatility Forecasting</h1>
         </div>
       </header>
-
-      <div class="metrics" id="metrics-live">
-        <article class="metric-card">
-          <p class="metric-label">Volatility forecast (next 60s, refreshed every 60s)</p>
-          <p class="metric-value" id="market-value">—</p>
-        </article>
-        <article class="metric-card">
-          <p class="metric-label">Last Refresh</p>
-          <p class="metric-value" id="last-refresh">--</p>
-        </article>
-      </div>
 
       <section class="chart-panel">
         <div class="panel-title-row">
           <div class="live-chart-heading">
-            <h2 id="chart-title">BTC/USDT $</h2>
-            <p class="live-chart-price" id="live-chart-price">--</p>
-            <p class="live-chart-price is-hidden" id="seven-day-price">--</p>
+            <h2 id="chart-title">BTC/USDT (1h)</h2>
           </div>
           <div class="panel-controls">
             <label class="select-label" for="graph-select">Graph</label>
             <select id="graph-select" class="select-input">
-              <option value="live" selected>Live (next 60s band)</option>
+              <option value="1h" selected>Last 12 hours</option>
               <option value="7d">Last 7 days</option>
             </select>
-            <span class="panel-subtitle" id="ws-status">Connecting...</span>
           </div>
         </div>
-        <div id="graph-live">
-          <div id="price-chart" style="width: 100%; height: 320px"></div>
-          <p class="chart-legend" id="live-chart-legend">
+
+        <div id="graph-1h">
+          <div class="metrics metrics--compact">
+            <article class="metric-card">
+              <p class="metric-label">Last volatility forecast</p>
+              <p class="metric-value" id="vol-1h-sigma">—</p>
+            </article>
+            <article class="metric-card">
+              <p class="metric-label">last hour result</p>
+              <p class="metric-value" id="in-bound-1h">—</p>
+            </article>
+            <article class="metric-card">
+              <p class="metric-label">Last updated</p>
+              <p class="metric-value" id="last-updated-1h">—</p>
+            </article>
+          </div>
+          <div class="panel-title-row panel-title-row--tight">
+            <div class="chart-7d-heading">
+              <h2>BTC/USDT last 12h</h2>
+            </div>
+            <span class="panel-subtitle" id="rest-1h-status">Loading...</span>
+          </div>
+          <div id="chart-1h" style="width: 100%; height: 320px"></div>
+          <p class="chart-legend">
             <span class="chart-legend-row">
               <span class="chart-legend-swatch" aria-hidden="true"></span>
-              <span>Price range according to the GARCH model volatility forecast (next 60s, refreshed every 60s).</span>
+              <span>Price range according to the 1h forecast when available.</span>
             </span>
             <span class="chart-legend-row">
               <span class="chart-legend-swatch chart-legend-swatch--spot" aria-hidden="true"></span>
-              <span>Actual price.</span>
+              <span>Actual hourly close.</span>
             </span>
           </p>
+          <div class="rollup rollup--open">
+            <div class="rollup-title">Forecast success rate (saved forecasts)</div>
+            <div class="rollup-body">
+              <p class="metric-value" id="forecast-success-rate-1h">—</p>
+            </div>
+          </div>
         </div>
 
         <div id="graph-7d" class="is-hidden">
           <div class="metrics metrics--compact">
             <article class="metric-card">
-              <p class="metric-label">24h volatility forecast</p>
+              <p class="metric-label">Last volatility forecast</p>
               <p class="metric-value" id="vol-24h-sigma">—</p>
             </article>
             <article class="metric-card">
@@ -68,12 +81,8 @@
               <p class="metric-value" id="yday-band">—</p>
             </article>
             <article class="metric-card">
-              <p class="metric-label">7d range</p>
-              <p class="metric-value">
-                <span id="chart-7d-low">—</span>
-                <span class="chart-7d-range-sep">·</span>
-                <span id="chart-7d-high">—</span>
-              </p>
+              <p class="metric-label">Last updated</p>
+              <p class="metric-value" id="last-updated-7d">—</p>
             </article>
           </div>
 
@@ -95,9 +104,9 @@
             </span>
           </p>
           <div class="rollup rollup--open">
-            <div class="rollup-title">Recent 24h forecast errors</div>
+            <div class="rollup-title">Forecast success rate (saved forecasts)</div>
             <div class="rollup-body">
-              <ul class="rollup-list" id="errors-24h-list"></ul>
+              <p class="metric-value" id="forecast-success-rate">—</p>
             </div>
           </div>
         </div>

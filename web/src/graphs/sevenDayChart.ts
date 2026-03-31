@@ -1,11 +1,8 @@
 import ApexCharts from "apexcharts";
 import type { ApexAxisChartSeries } from "apexcharts";
-import type { SavedForecast } from "./liveForecast10sChart";
+import type { SavedForecast } from "./forecastTypes";
 
 export type DailyPoint = { open_time: number; close: number | null; label?: string };
-
-const chart7dLowEl = document.getElementById("chart-7d-low");
-const chart7dHighEl = document.getElementById("chart-7d-high");
 
 const MS_PER_DAY = 86_400_000;
 
@@ -67,12 +64,32 @@ function formatYLabel2(v: unknown): string {
   return n.toFixed(2);
 }
 
-function formatDateUtcShort(ms: number): string {
+function formatDateLocalShort(ms: number): string {
   const d = new Date(ms);
   if (!Number.isFinite(d.getTime())) return "";
-  const month = d.toLocaleString(undefined, { month: "short", timeZone: "UTC" });
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  return `${month} ${day} (UTC)`;
+  const month = d.toLocaleString(undefined, { month: "short" });
+  const day = String(d.getDate()).padStart(2, "0");
+  const hour = String(d.getHours()).padStart(2, "0");
+  const minute = String(d.getMinutes()).padStart(2, "0");
+  const tz = (() => {
+    try {
+      const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" }).formatToParts(d);
+      return parts.find((p) => p.type === "timeZoneName")?.value ?? "local";
+    } catch {
+      return "local";
+    }
+  })();
+  return `${month} ${day} ${hour}:${minute} (${tz})`;
+}
+
+function isSameLocalDay(aMs: number, bMs: number): boolean {
+  const a = new Date(aMs);
+  const b = new Date(bMs);
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
 }
 
 function nearestCloseFromSeries(w: any, x: number): { x: number; y: number } | null {
@@ -91,6 +108,20 @@ function nearestCloseFromSeries(w: any, x: number): { x: number; y: number } | n
     }
   }
   return best;
+}
+
+function hoveredXFromContext(w: any, seriesIndex: number, dataPointIndex: number): number | null {
+  const rawPoint = w?.config?.series?.[seriesIndex]?.data?.[dataPointIndex];
+  const rawX = rawPoint?.x;
+  if (typeof rawX === "number" && Number.isFinite(rawX)) return rawX;
+  if (typeof rawX === "string") {
+    const parsed = Date.parse(rawX);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  const sx = w?.globals?.seriesX?.[seriesIndex]?.[dataPointIndex];
+  const x = typeof sx === "number" ? sx : Number(sx);
+  if (Number.isFinite(x)) return x;
+  return null;
 }
 
 function safeMinMax(nums: number[]): { min: number; max: number } | null {
@@ -125,14 +156,17 @@ function ensure7dChart(): ApexCharts | null {
     },
     legend: { show: false },
     dataLabels: { enabled: false },
+    // Keep marker styling consistent from first render to avoid startup flicker/races.
     markers: {
-      size: 3,
-      strokeWidth: 0,
-      hover: { size: 5 },
+      size: 4,
+      strokeColors: "#FFFFFF",
+      strokeWidth: 2,
+      hover: { size: 6 },
+      discrete: [],
     },
     xaxis: {
       type: "datetime",
-      labels: { datetimeUTC: true },
+      labels: { datetimeUTC: false },
       axisBorder: { show: false },
       axisTicks: { show: false },
     },
@@ -146,19 +180,24 @@ function ensure7dChart(): ApexCharts | null {
     ],
     tooltip: {
       theme: "dark",
+      // Snap by x-position so hovering above/below a point still shows that day's close.
+      shared: true,
+      intersect: false,
+      enabledOnSeries: [0],
       custom: ({ seriesIndex, dataPointIndex, w }: any) => {
-        const sx = w?.globals?.seriesX?.[seriesIndex]?.[dataPointIndex];
-        const x = typeof sx === "number" ? sx : Number(sx);
-        const close = Number.isFinite(x) ? nearestCloseFromSeries(w, x) : null;
-        const dateLabel = close ? formatDateUtcShort(close.x) : Number.isFinite(x) ? formatDateUtcShort(x) : "";
+        const x = hoveredXFromContext(w, seriesIndex, dataPointIndex);
+        const close = x !== null && Number.isFinite(x) ? nearestCloseFromSeries(w, x) : null;
+        const dateLabel = close ? formatDateLocalShort(close.x) : "";
         const closeLabel = close ? close.y.toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—";
+        const isCurrentLocalDay = close ? isSameLocalDay(close.x, Date.now()) : false;
+        const valueLabel = isCurrentLocalDay ? "Current day price: " : "Close: ";
         return `
           <div class="apexcharts-tooltip-title">${dateLabel}</div>
           <div class="apexcharts-tooltip-series-group apexcharts-active" style="display:flex;">
             <span class="apexcharts-tooltip-marker" style="background-color:#5E97F6;"></span>
             <div class="apexcharts-tooltip-text">
               <div class="apexcharts-tooltip-y-group">
-                <span class="apexcharts-tooltip-text-y-label">Close: </span>
+                <span class="apexcharts-tooltip-text-y-label">${valueLabel}</span>
                 <span class="apexcharts-tooltip-text-y-value">${closeLabel}</span>
               </div>
             </div>
@@ -206,12 +245,19 @@ function buildBandBoxes(points: DailyPoint[], forecasts: SavedForecast[]): BandB
     const k = dateKeyUtc(ts);
     const idx = points.findIndex((p) => p.close !== null && dateKeyUtc(p.open_time) === k);
     // Forecast at day D 00:00 applies to day D move, anchored on day D-1 close.
+    // Draw historical boxes one slot back so "yesterday" does not sit on top of
+    // the current/today tunnel.
     if (idx <= 0) continue;
     const baseClose = points[idx - 1].close as number;
     if (!Number.isFinite(baseClose)) continue;
     const sigma = Math.max(fp.garch_forecast, 0);
-    // Historical: keep as a day-sized box on day D.
-    push(points[idx].open_time, points[idx].open_time + MS_PER_DAY, baseClose * (1 - sigma), baseClose * (1 + sigma));
+    // Historical: render across the previous day slot [D-1, D).
+    push(
+      points[idx - 1].open_time,
+      points[idx].open_time,
+      baseClose * (1 - sigma),
+      baseClose * (1 + sigma),
+    );
   }
 
   // Latest/current forecast: prefer to place it on the last real day slot (today),
@@ -236,10 +282,18 @@ function buildBandBoxes(points: DailyPoint[], forecasts: SavedForecast[]): BandB
       const lastReal = [...points].reverse().find((p) => p.close !== null)?.close ?? null;
       if (futureIdx >= 0 && lastReal !== null && Number.isFinite(lastReal)) {
         const sigma = Math.max(latest.garch_forecast, 0);
-        // Fallback: if we can't match "today", place a day-sized box at the future slot.
+        // Fallback: keep the latest tunnel continuous through the future slot
+        // (same visual behavior as the 12h graph's latest range).
+        const x0 =
+          futureIdx > 0 && Number.isFinite(points[futureIdx - 1]?.open_time)
+            ? points[futureIdx - 1].open_time
+            : points[futureIdx].open_time;
+        const x1 = points[futureIdx].open_time + MS_PER_DAY;
         push(
-          points[futureIdx].open_time,
-          points[futureIdx].open_time + MS_PER_DAY,
+          x0,
+          x1,
+          lastReal * (1 - sigma),
+          lastReal * (1 + sigma),
           lastReal * (1 - sigma),
           lastReal * (1 + sigma),
         );
@@ -265,21 +319,6 @@ export function drawSevenDayChart(points: DailyPoint[], lastSavedForecasts: Save
 
   const boxes = buildBandBoxes(points, lastSavedForecasts);
 
-  const lastCloseMarker =
-    closes.length > 0
-      ? [
-          {
-            seriesIndex: 0,
-            dataPointIndex: closes.length - 1,
-            size: 6,
-            fillColor: "#5E97F6",
-            strokeColor: "#FFFFFF",
-            strokeWidth: 2,
-            shape: "circle",
-          },
-        ]
-      : [];
-
   // "Camera" framing: show the entire 7d window (including the full last day),
   // and include any forecast-band boxes.
   const xCandidates: number[] = [];
@@ -304,12 +343,14 @@ export function drawSevenDayChart(points: DailyPoint[], lastSavedForecasts: Save
   }
 
   // Y scale: fit the entire plotted graph in the camera view (closes + ALL band boxes).
-  const closeYs = closes.map((c) => c.y);
+  const closeYs = closes.map((c) => c.y).filter((v) => Number.isFinite(v));
+  // Single source of truth for lows/highs: raw plotted close values.
+  const closeMm = safeMinMax(closeYs);
   const yCandidates: number[] = [...closeYs];
   for (const b of boxes) yCandidates.push(b.lo, b.hi);
   const mm = safeMinMax(yCandidates);
 
-  // Build series: one close line + ONE rangeArea series per band box.
+  // Build series: close line + ONE rangeArea series per band box.
   const series: ApexAxisChartSeries = [];
   series.push({ name: "Close", type: "line", data: closes } as any);
   boxes.forEach((b, i) => {
@@ -328,83 +369,76 @@ export function drawSevenDayChart(points: DailyPoint[], lastSavedForecasts: Save
   const colors = ["#5E97F6", ...boxes.map(() => "#FFFFFF")];
   const strokeWidths = [2, ...boxes.map(() => 1)];
   const fillOpacities = [1, ...boxes.map(() => 0.14)];
+  // Smaller close dots with a white ring for glow/contrast.
+  const markerSizes = [4, ...boxes.map(() => 0)];
 
   if (mm) {
-    // Hard "camera" range requested: show the full 53k..73k window.
-    // If data exceeds that window, expand to include everything.
-    const targetMin = 53_000;
-    const targetMax = 73_000;
-    const yMin = Math.min(targetMin, mm.min);
-    const yMax = Math.max(targetMax, mm.max);
-    if (chart7dLowEl) chart7dLowEl.textContent = yMin.toLocaleString(undefined, { maximumFractionDigits: 0 });
-    if (chart7dHighEl) chart7dHighEl.textContent = yMax.toLocaleString(undefined, { maximumFractionDigits: 0 });
-    void chart.updateOptions(
-      {
-        colors,
-        stroke: { curve: "straight", width: strokeWidths },
-        fill: { type: "solid", opacity: fillOpacities },
-        markers: {
-          size: 3,
-          strokeWidth: 0,
-          hover: { size: 5 },
-          discrete: lastCloseMarker as any,
-        },
-        xaxis: {
-          min: xMin,
-          max: xMax,
-          type: "datetime",
-          labels: { datetimeUTC: true },
-          axisBorder: { show: false },
-          axisTicks: { show: false },
-        },
-        // Use array form so Apex applies bounds reliably with multi-series.
-        yaxis: [
-          {
-            min: yMin,
-            max: yMax,
-            decimalsInFloat: 2,
-            tickAmount: 9,
-            forceNiceScale: false,
-            labels: { formatter: formatYLabel2 },
-          },
-        ],
+    // Reliable graph floor + fixed visual breathing room at the bottom.
+    const yMin = (closeMm ? closeMm.min : mm.min) - 9000;
+    const yMax = mm.max;
+    const nextOptions: ApexCharts.ApexOptions = {
+      colors,
+      stroke: { curve: "straight", width: strokeWidths },
+      fill: { type: "solid", opacity: fillOpacities },
+      markers: {
+        size: markerSizes as any,
+        strokeColors: "#FFFFFF",
+        strokeWidth: 2,
+        hover: { size: 6 },
+        discrete: [],
       },
-      true,
-      false,
-    );
+      xaxis: {
+        min: xMin,
+        max: xMax,
+        type: "datetime",
+        labels: { datetimeUTC: false },
+        axisBorder: { show: false },
+        axisTicks: { show: false },
+      },
+      // Use array form so Apex applies bounds reliably with multi-series.
+      yaxis: [
+        {
+          min: yMin,
+          max: yMax,
+          decimalsInFloat: 2,
+          tickAmount: 9,
+          forceNiceScale: false,
+          labels: { formatter: formatYLabel2 },
+        },
+      ],
+    };
+    void chart
+      .updateSeries(series as any, false)
+      .then(() => chart.updateOptions(nextOptions, true, false));
   } else {
-    if (chart7dLowEl) chart7dLowEl.textContent = "—";
-    if (chart7dHighEl) chart7dHighEl.textContent = "—";
-    void chart.updateOptions(
-      {
-        colors,
-        stroke: { curve: "straight", width: strokeWidths },
-        fill: { type: "solid", opacity: fillOpacities },
-        markers: {
-          size: 3,
-          strokeWidth: 0,
-          hover: { size: 5 },
-          discrete: lastCloseMarker as any,
-        },
-        xaxis: {
-          min: xMin,
-          max: xMax,
-          type: "datetime",
-          labels: { datetimeUTC: true },
-          axisBorder: { show: false },
-          axisTicks: { show: false },
-        },
-        yaxis: [
-          {
-            decimalsInFloat: 2,
-            labels: { formatter: formatYLabel2 },
-          },
-        ],
+    const nextOptions: ApexCharts.ApexOptions = {
+      colors,
+      stroke: { curve: "straight", width: strokeWidths },
+      fill: { type: "solid", opacity: fillOpacities },
+      markers: {
+        size: markerSizes as any,
+        strokeColors: "#FFFFFF",
+        strokeWidth: 2,
+        hover: { size: 6 },
+        discrete: [],
       },
-      true,
-      false,
-    );
+      xaxis: {
+        min: xMin,
+        max: xMax,
+        type: "datetime",
+        labels: { datetimeUTC: false },
+        axisBorder: { show: false },
+        axisTicks: { show: false },
+      },
+      yaxis: [
+        {
+          decimalsInFloat: 2,
+          labels: { formatter: formatYLabel2 },
+        },
+      ],
+    };
+    void chart
+      .updateSeries(series as any, false)
+      .then(() => chart.updateOptions(nextOptions, true, false));
   }
-
-  void chart.updateSeries(series as any, false);
 }

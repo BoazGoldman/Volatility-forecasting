@@ -1,16 +1,4 @@
-import {
-  MAX_POINTS,
-  drawLiveForecastChart,
-  latest10sGarchSigma,
-  latest10sGarchSigmaUpdatedAtMs,
-  loadForecasts10sSigma,
-  layoutPriceChartCanvas,
-  liveRangeColW,
-  refreshLiveForecastRangeLabel,
-  shiftLiveChartAfterRingBufferPop,
-  tryActivatePendingTunnel,
-  type SavedForecast,
-} from "./graphs/liveForecast10sChart";
+import type { SavedForecast } from "./graphs/forecastTypes";
 import {
   dailyPointsFromApi,
   dateKeyUtc,
@@ -20,93 +8,148 @@ import {
   splitForecastRows,
   type DailyPoint,
 } from "./graphs/sevenDayChart";
+import {
+  drawOneHourChart,
+  hourlyPointsFromApi,
+  layoutChart1hCanvas,
+  resizeOneHourChart,
+  type HourlyPoint,
+} from "./graphs/oneHourChart";
 
-/** σ is polled periodically from backend and applied to the next realized step. */
-const prices: number[] = [];
-/**
- * `forwardForecastSigma[i]` = lagged GARCH σ for the move from anchor `prices[i]` to actual `prices[i+1]`
- * (same idea as 7d: band from previous close, drawn at the slot where the outcome lands).
- */
-const forwardForecastSigma: (number | null)[] = [];
-/** Frozen band bounds for each realized step i (anchor=prices[i], outcome=prices[i+1]). */
-const forwardForecastLow: (number | null)[] = [];
-const forwardForecastHigh: (number | null)[] = [];
-/** Frozen pixel width per band so older bands don't change thickness when `n` changes. */
-const forwardForecastColW: (number | null)[] = [];
-/** Extra column after last spot: σ from latest JSON, anchor = last close (shown until next poll). */
-let pendingForwardBand:
-  | { anchorPrice: number; sigma: number; low: number; high: number; colW: number }
-  | null = null;
-/**
- * σ observed on the previous poll. When a new price arrives, we freeze the previous step's
- * band to the σ that was available on that prior poll (so older bands never change).
- */
-let sigmaFromPreviousPoll: number | null = null;
-/**
- * Anchor for the "pending" (next-step) forecast band.
- * We freeze this anchor at the moment we receive a new σ (poll),
- * so the band does NOT recenter on every WS price tick.
- *
- * NOTE: We only re-center this anchor once per poll bucket,
- * so the visible band doesn't re-anchor on every WS tick.
- */
-let pendingBandAnchorPrice: number | null = null;
-let lastBandRecenterBucket: number | null = null;
 const BINANCE_SYMBOL = "BTCUSDT";
 const BINANCE_PAIR = "BTC/USDT";
-const CUSUM_JSON_URL = "/cusum.json";
 const API_BASE =
   (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_BASE ??
   "http://127.0.0.1:8000";
-const WS_BASE = API_BASE.startsWith("https://")
-  ? API_BASE.replace(/^https:/, "wss:")
-  : API_BASE.replace(/^http:/, "ws:");
 
 const MARKET_DAILY_URL = `${API_BASE}/market/daily?symbol=${encodeURIComponent(BINANCE_SYMBOL)}&days=7`;
-const CUSUM_POLL_MS = 60_000;
-/** Live σ reload cadence (60s band). */
-const POLL_MS = 50_000;
+const MARKET_HOURLY_URL = `${API_BASE}/market/hourly?symbol=${encodeURIComponent(BINANCE_SYMBOL)}&hours=12`;
 /** 7d Binance klines + saved forecasts: schedule reloads at these UTC hours only. */
 const SEVEN_DAY_UTC_RELOAD_HOURS = [0, 12] as const;
 
-const wsStatusEl = document.getElementById("ws-status");
-const liveChartPriceEl = document.getElementById("live-chart-price");
-const sevenDayPriceEl = document.getElementById("seven-day-price");
-const lastRefreshEl = document.getElementById("last-refresh");
-const marketEl = document.getElementById("market-value");
+const chartTitleEl = document.getElementById("chart-title");
 const rest7dStatusEl = document.getElementById("rest-7d-status");
+const rest1hStatusEl = document.getElementById("rest-1h-status");
+const vol1hSigmaEl = document.getElementById("vol-1h-sigma");
+const inBound1hEl = document.getElementById("in-bound-1h");
+const lastUpdated1hEl = document.getElementById("last-updated-1h");
+const forecastSuccessRate1hEl = document.getElementById("forecast-success-rate-1h");
 const vol24hSigmaEl = document.getElementById("vol-24h-sigma");
 const ydayBandEl = document.getElementById("yday-band");
-const signalListEl = document.getElementById("signal-list") as HTMLUListElement | null;
-const cusumStatusEl = document.getElementById("cusum-status");
-const errors24hListEl = document.getElementById("errors-24h-list") as HTMLUListElement | null;
+const lastUpdated7dEl = document.getElementById("last-updated-7d");
+const forecastSuccessRateEl = document.getElementById("forecast-success-rate");
 const graphSelectEl = document.getElementById("graph-select") as HTMLSelectElement | null;
-const graphLiveEl = document.getElementById("graph-live");
 const graph7dEl = document.getElementById("graph-7d");
-const metricsLiveEl = document.getElementById("metrics-live");
-const chartTitleEl = document.getElementById("chart-title");
-
-// Smoothly animate the displayed "price:" label between WS ticks.
-let priceLabelRaf = 0;
-let priceAnimFrom: number | null = null;
-let priceAnimTo: number | null = null;
-let priceAnimStartMs = 0;
-const PRICE_ANIM_MS = 6000;
-
-/** Rows exported from Python (e.g. web/public/cusum.json). */
-type CusumSignalRow = {
-  timestamp: string;
-  /** -1 sell, 0 neutral/hold, 1 buy — matches `cusum_signal` from pipeline. */
-  cusum_signal: number;
-  /** Optional short note (e.g. spread pair label). */
-  detail?: string;
-};
+const graph1hEl = document.getElementById("graph-1h");
 
 let lastSevenDayDisplay: DailyPoint[] = [];
-let lastSavedForecasts: SavedForecast[] = [];
-let activeGraph: "live" | "7d" = "live";
+let lastOneHourDisplay: HourlyPoint[] = [];
+let lastSavedForecasts7d: SavedForecast[] = [];
+let lastSavedForecasts1h: SavedForecast[] = [];
+let activeGraph: "1h" | "7d" = "1h";
 let sevenDayHasLoaded = false;
-let wsIsOpen = false;
+let oneHourHasLoaded = false;
+let oneHourLoadInFlight: Promise<void> | null = null;
+let oneHourForecastRefreshInFlight: Promise<void> | null = null;
+let sevenDayLoadInFlight: Promise<void> | null = null;
+
+function formatLocalUpdateTime(ms: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZoneName: "short",
+  }).format(new Date(ms));
+}
+
+function updateOneHourKpis(points: HourlyPoint[], forecasts: SavedForecast[]) {
+  if (vol1hSigmaEl) vol1hSigmaEl.textContent = "—";
+  if (lastUpdated1hEl) lastUpdated1hEl.textContent = "—";
+  if (inBound1hEl) {
+    inBound1hEl.textContent = "—";
+    inBound1hEl.classList.remove("buy", "sell", "neutral");
+    inBound1hEl.classList.add("neutral");
+  }
+  if (forecastSuccessRate1hEl) {
+    forecastSuccessRate1hEl.textContent = "—";
+    forecastSuccessRate1hEl.classList.remove("buy", "sell", "neutral");
+    forecastSuccessRate1hEl.classList.add("neutral");
+  }
+
+  if (forecasts.length > 0 && vol1hSigmaEl) {
+    const latestForecast = [...forecasts]
+      .filter((r) => Number.isFinite(Date.parse(r.timestamp)) && Number.isFinite(Number(r.garch_forecast)))
+      .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
+      .at(-1);
+    if (latestForecast) {
+      const s = Math.max(Number(latestForecast.garch_forecast), 0);
+      if (Number.isFinite(s)) vol1hSigmaEl.textContent = `${(s * 100).toFixed(4)}%`;
+      if (lastUpdated1hEl) {
+        const ts = Date.parse(latestForecast.timestamp);
+        if (Number.isFinite(ts)) lastUpdated1hEl.textContent = formatLocalUpdateTime(ts);
+      }
+    }
+  }
+
+  if (!inBound1hEl) return;
+  const realPoints = points.filter((p) => typeof p.close === "number" && Number.isFinite(p.close));
+  if (realPoints.length < 2 || forecasts.length === 0) return;
+
+  const latestClose = realPoints[realPoints.length - 1].close as number;
+  const prevClose = realPoints[realPoints.length - 2].close as number;
+  const latestForecast = [...forecasts]
+    .filter((r) => Number.isFinite(Date.parse(r.timestamp)) && Number.isFinite(Number(r.garch_forecast)))
+    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
+    .at(-1);
+  if (!latestForecast || !Number.isFinite(prevClose) || !Number.isFinite(latestClose) || prevClose <= 0) return;
+
+  const sigma = Math.max(Number(latestForecast.garch_forecast), 0);
+  if (!Number.isFinite(sigma)) return;
+  const lo = prevClose * (1 - sigma);
+  const hi = prevClose * (1 + sigma);
+  const low = Math.min(lo, hi);
+  const high = Math.max(lo, hi);
+
+  inBound1hEl.classList.remove("buy", "sell", "neutral");
+  if (latestClose >= low && latestClose <= high) {
+    inBound1hEl.textContent = "In bound";
+    inBound1hEl.classList.add("buy");
+  } else {
+    inBound1hEl.textContent = "Out of bound";
+    inBound1hEl.classList.add("sell");
+  }
+
+  if (!forecastSuccessRate1hEl) return;
+  const forecastRows = forecasts
+    .map((f) => ({ t: Date.parse(f.timestamp), sigma: Math.max(Number(f.garch_forecast), 0) }))
+    .filter((f) => Number.isFinite(f.t) && Number.isFinite(f.sigma))
+    .sort((a, b) => a.t - b.t);
+  if (forecastRows.length === 0) return;
+
+  let j = 0;
+  let total = 0;
+  let inside = 0;
+  for (let i = 1; i < realPoints.length; i += 1) {
+    const t = realPoints[i].open_time;
+    const prev = realPoints[i - 1].close as number;
+    const curr = realPoints[i].close as number;
+    if (!Number.isFinite(t) || !Number.isFinite(prev) || !Number.isFinite(curr) || prev <= 0) continue;
+    while (j + 1 < forecastRows.length && forecastRows[j + 1].t <= t) j += 1;
+    if (forecastRows[j].t > t) continue;
+    const s = forecastRows[j].sigma;
+    const low = prev * (1 - s);
+    const high = prev * (1 + s);
+    total += 1;
+    if (curr >= Math.min(low, high) && curr <= Math.max(low, high)) inside += 1;
+  }
+  if (total === 0) return;
+  const rate = (inside / total) * 100;
+  forecastSuccessRate1hEl.textContent = `${rate.toFixed(1)}% (${inside}/${total})`;
+  forecastSuccessRate1hEl.classList.remove("neutral");
+  forecastSuccessRate1hEl.classList.add(rate >= 50 ? "buy" : "sell");
+}
 
 async function loadSavedForecasts(): Promise<SavedForecast[]> {
   const DAILY_FORECAST_TIMEFRAME = "1h_24h_at_00utc";
@@ -129,401 +172,201 @@ async function loadSavedForecasts(): Promise<SavedForecast[]> {
   return [];
 }
 
-function getLiveForecastSeries() {
-  return {
-    prices,
-    forwardForecastSigma,
-    forwardForecastLow,
-    forwardForecastHigh,
-    pendingForwardBand,
-  };
-}
-
-function startPriceLabelAnimation(to: number) {
-  if (!Number.isFinite(to)) return;
-  const now = performance.now();
-  if (priceAnimTo === null) {
-    priceAnimFrom = to;
-    priceAnimTo = to;
-    priceAnimStartMs = now;
-  } else {
-    // Start a new animation from current displayed value.
-    const t = PRICE_ANIM_MS > 0 ? Math.min(1, Math.max(0, (now - priceAnimStartMs) / PRICE_ANIM_MS)) : 1;
-    const a = priceAnimFrom ?? priceAnimTo;
-    const b = priceAnimTo;
-    const current = a + (b - a) * t;
-    priceAnimFrom = current;
-    priceAnimTo = to;
-    priceAnimStartMs = now;
-  }
-  if (!priceLabelRaf) priceLabelRaf = requestAnimationFrame(tickPriceLabel);
-}
-
-function tickPriceLabel() {
-  priceLabelRaf = 0;
-  if (document.visibilityState !== "visible") return;
-  if (!liveChartPriceEl) return;
-  if (priceAnimTo === null || priceAnimFrom === null) return;
-
-  const now = performance.now();
-  const t = PRICE_ANIM_MS > 0 ? Math.min(1, Math.max(0, (now - priceAnimStartMs) / PRICE_ANIM_MS)) : 1;
-  const y = priceAnimFrom + (priceAnimTo - priceAnimFrom) * t;
-  liveChartPriceEl.textContent = `price: ${y.toFixed(2)}`;
-
-  if (t < 1) priceLabelRaf = requestAnimationFrame(tickPriceLabel);
-}
-
-function handleNewSpotPrice(close: number) {
-  if (!Number.isFinite(close)) return;
-  const sigmaForPreviousStep = sigmaFromPreviousPoll;
-
-  /** Same Binance snapshot re-emitted on the 1s tick — refresh labels without growing the series. */
-  const prevClose = prices.length > 0 ? prices[prices.length - 1] : null;
-  const sameAsLast = prevClose !== null && close === prevClose;
-
-  if (!sameAsLast) {
-    prices.push(close);
-    forwardForecastSigma.push(null);
-    forwardForecastLow.push(null);
-    forwardForecastHigh.push(null);
-    forwardForecastColW.push(null);
-    const nPts = prices.length;
-    if (nPts >= 2) {
-      forwardForecastSigma[nPts - 2] = sigmaForPreviousStep;
-      const anchor = prices[nPts - 2];
-      if (sigmaForPreviousStep !== null && sigmaForPreviousStep > 0 && Number.isFinite(anchor)) {
-        forwardForecastLow[nPts - 2] = anchor * (1 - sigmaForPreviousStep);
-        forwardForecastHigh[nPts - 2] = anchor * (1 + sigmaForPreviousStep);
-      }
-      layoutPriceChartCanvas();
-      const livePriceCanvas = document.getElementById("price-chart") as HTMLCanvasElement | null;
-      if (livePriceCanvas) forwardForecastColW[nPts - 2] = liveRangeColW(livePriceCanvas.width, nPts);
-    }
-    if (prices.length > MAX_POINTS) {
-      prices.shift();
-      forwardForecastSigma.shift();
-      forwardForecastLow.shift();
-      forwardForecastHigh.shift();
-      forwardForecastColW.shift();
-      shiftLiveChartAfterRingBufferPop();
-    }
-  }
-  sigmaFromPreviousPoll =
-    latest10sGarchSigma !== null && latest10sGarchSigma > 0 ? latest10sGarchSigma : null;
-
-  const lastClose = prices[prices.length - 1];
-  const anchor = pendingBandAnchorPrice;
-  if (
-    latest10sGarchSigma !== null &&
-    latest10sGarchSigma > 0 &&
-    Number.isFinite(lastClose) &&
-    anchor !== null &&
-    Number.isFinite(anchor)
-  ) {
-    layoutPriceChartCanvas();
-    const livePriceCanvas = document.getElementById("price-chart") as HTMLCanvasElement | null;
-    const colW = livePriceCanvas ? liveRangeColW(livePriceCanvas.width, prices.length) : 3;
-    pendingForwardBand = {
-      anchorPrice: anchor,
-      sigma: latest10sGarchSigma,
-      low: anchor * (1 - latest10sGarchSigma),
-      high: anchor * (1 + latest10sGarchSigma),
-      colW,
-    };
-  } else {
-    pendingForwardBand = null;
-  }
-
-  // Only update the visible LIVE UI while the live graph is selected.
-  // We still keep the internal ring buffer warm so switching back to live is instant.
-  if (activeGraph === "live") {
-    tryActivatePendingTunnel(prices);
-    drawLiveForecastChart(getLiveForecastSeries);
-
-    const timestamp = new Date().toLocaleTimeString();
-    startPriceLabelAnimation(close);
-    refreshLiveForecastRangeLabel(prices);
-
-    if (lastRefreshEl) lastRefreshEl.textContent = timestamp;
-    if (marketEl) {
-      const s = latest10sGarchSigma;
-      marketEl.textContent =
-        typeof s === "number" && Number.isFinite(s) && s > 0 ? `${(s * 100).toFixed(4)}%` : "—";
-    }
-  }
-}
-
-function startLivePriceWs() {
-  const url = `${WS_BASE}/ws/price?symbol=btcusdt&interval_ms=5000`;
-  setWsStatus("Connecting...", "neutral");
-  let ws: WebSocket | null = null;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let visibilityHideTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Exponential backoff (ms) after drops / Wi‑Fi flaps — caps load on the API. */
-  let reconnectDelayMs = 1200;
-  const RECONNECT_DELAY_MAX_MS = 30_000;
-  const HIDDEN_DISCONNECT_MS = 15_000;
-  let lastUiUpdate = 0;
-  /** Server emits ~1/s; keep below tick interval so seconds are not dropped. */
-  const MIN_UI_MS = 400;
-  const MAX_SIGMA_STALENESS_MS = POLL_MS * 3;
-
-  const clearReconnectTimer = () => {
-    if (reconnectTimer !== null) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-  };
-
-  const scheduleReconnect = () => {
-    if (document.visibilityState !== "visible") return;
-    clearReconnectTimer();
-    const jitter = 200 + Math.floor(Math.random() * 400);
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      connect();
-    }, reconnectDelayMs + jitter);
-    reconnectDelayMs = Math.min(
-      Math.floor(reconnectDelayMs * 1.85),
-      RECONNECT_DELAY_MAX_MS,
-    );
-  };
-
-  const disconnect = () => {
-    clearReconnectTimer();
-    if (ws !== null) {
-      ws.onopen = null;
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.onmessage = null;
-      try {
-        ws.close();
-      } catch {
-        // ignore
-      }
-      ws = null;
-    }
-  };
-
-  const connect = () => {
-    if (document.visibilityState !== "visible") return;
-    ws = new WebSocket(url);
-    ws.onopen = () => {
-      reconnectDelayMs = 1200;
-      wsIsOpen = true;
-      if (activeGraph === "live") setWsStatus("Live (WS)", "buy");
-    };
-    ws.onclose = () => {
-      ws = null;
-      wsIsOpen = false;
-      if (document.visibilityState === "visible") {
-        if (activeGraph === "live") setWsStatus("WS reconnecting…", "neutral");
-        scheduleReconnect();
-      } else {
-        if (activeGraph === "live") setWsStatus("WS paused (tab in background)", "neutral");
-      }
-    };
-    ws.onerror = () => {
-      wsIsOpen = false;
-      if (activeGraph === "live") setWsStatus("WS error", "sell");
-    };
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(String(ev.data)) as { type?: string; price?: number };
-        if (msg.type !== "trade") return;
-        const p = Number(msg.price);
-        const now = Date.now();
-        if (now - lastUiUpdate < MIN_UI_MS) return;
-        lastUiUpdate = now;
-        // Ensure σ doesn't go stale while WS prices keep flowing (e.g., if the polling interval was paused).
-        if (
-          latest10sGarchSigmaUpdatedAtMs > 0 &&
-          MAX_SIGMA_STALENESS_MS > 0 &&
-          now - latest10sGarchSigmaUpdatedAtMs > MAX_SIGMA_STALENESS_MS
-        ) {
-          void loadCurrentPrice();
+async function loadSavedForecasts1h(): Promise<SavedForecast[]> {
+  const HOURLY_FORECAST_TIMEFRAME = "5m_1h";
+  const urlFromApi = `${API_BASE}/forecasts?symbol=${encodeURIComponent(BINANCE_PAIR)}&timeframe=${encodeURIComponent(HOURLY_FORECAST_TIMEFRAME)}&newest_first=false&limit=24&include_delta_to_latest=true`;
+  const tryUrls = [urlFromApi, "/forecasts_1h.json"];
+  for (const url of tryUrls) {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) continue;
+      const payload = (await res.json()) as {
+        latest_garch_forecast?: number | null;
+        forecasts?: Array<{ timestamp?: string; garch_forecast?: number; delta_to_latest?: number | null }>;
+      };
+      if (Array.isArray(payload.forecasts)) {
+        const parsed = payload.forecasts
+          .filter((r) => r && typeof r.timestamp === "string" && Number.isFinite(Number(r.garch_forecast)))
+          .map((r) => ({
+            timestamp: String(r.timestamp),
+            garch_forecast: Number(r.garch_forecast),
+            delta_to_latest:
+              r.delta_to_latest === null || r.delta_to_latest === undefined
+                ? null
+                : Number.isFinite(Number(r.delta_to_latest))
+                  ? Number(r.delta_to_latest)
+                  : null,
+          }));
+        if (url.endsWith("/forecasts_1h.json") && parsed.length > 0) {
+          const latest = parsed[parsed.length - 1]?.garch_forecast;
+          if (Number.isFinite(latest)) {
+            return parsed.map((r) => ({ ...r, delta_to_latest: r.garch_forecast - (latest as number) }));
+          }
         }
-        handleNewSpotPrice(p);
-      } catch {
-        // ignore
+        return parsed.slice(-24);
       }
-    };
-  };
-
-  const onVisibility = () => {
-    if (visibilityHideTimer !== null) {
-      clearTimeout(visibilityHideTimer);
-      visibilityHideTimer = null;
+    } catch {
+      // try next
     }
-    if (document.visibilityState === "visible") {
-      reconnectDelayMs = 1200;
-      if (ws === null || ws.readyState === WebSocket.CLOSED) {
-        setWsStatus("Connecting...", "neutral");
-        clearReconnectTimer();
-        connect();
-      }
-    } else {
-      visibilityHideTimer = setTimeout(() => {
-        visibilityHideTimer = null;
-        disconnect();
-        setWsStatus("WS paused (tab in background)", "neutral");
-      }, HIDDEN_DISCONNECT_MS);
+  }
+  return [];
+}
+
+function updateForecastSuccessRate(points: DailyPoint[], forecasts: SavedForecast[]) {
+  if (!forecastSuccessRateEl) return;
+  forecastSuccessRateEl.textContent = "—";
+  forecastSuccessRateEl.classList.remove("buy", "sell", "neutral");
+  forecastSuccessRateEl.classList.add("neutral");
+
+  const midnightRows = forecasts.filter((f) => {
+    const t = new Date(f.timestamp);
+    return (
+      Number.isFinite(t.getTime()) &&
+      t.getUTCHours() === 0 &&
+      t.getUTCMinutes() === 0 &&
+      t.getUTCSeconds() === 0
+    );
+  });
+  if (midnightRows.length === 0 || points.length < 2) return;
+
+  let total = 0;
+  let inside = 0;
+
+  for (const row of midnightRows) {
+    const ts = Date.parse(row.timestamp);
+    if (!Number.isFinite(ts)) continue;
+    const idx = points.findIndex((p) => p.close !== null && dateKeyUtc(p.open_time) === dateKeyUtc(ts));
+    if (idx <= 0) continue;
+
+    const baseClose = points[idx - 1].close;
+    const actualClose = points[idx].close;
+    const sigma = Math.max(Number(row.garch_forecast), 0);
+    if (
+      typeof baseClose !== "number" ||
+      typeof actualClose !== "number" ||
+      !Number.isFinite(baseClose) ||
+      !Number.isFinite(actualClose) ||
+      !Number.isFinite(sigma) ||
+      baseClose <= 0
+    ) {
+      continue;
     }
-  };
 
-  document.addEventListener("visibilitychange", onVisibility);
-  onVisibility();
-}
-
-function cusumClass(signal: number): "buy" | "sell" | "neutral" {
-  if (signal > 0) return "buy";
-  if (signal < 0) return "sell";
-  return "neutral";
-}
-
-function cusumLabel(signal: number): string {
-  if (signal > 0) return "Buy";
-  if (signal < 0) return "Sell";
-  return "Neutral";
-}
-
-function renderCusumSignals(rows: CusumSignalRow[]) {
-  if (!signalListEl) return;
-
-  signalListEl.innerHTML = "";
-
-  if (rows.length === 0) {
-    const li = document.createElement("li");
-    li.className = "signal-item";
-    li.innerHTML = '<span class="timestamp">—</span><span class="neutral">Cusum signals — future feature<span>';
-    signalListEl.appendChild(li);
-    if (cusumStatusEl) cusumStatusEl.textContent = "Cusum · coming later";
-    return;
+    const lo = baseClose * (1 - sigma);
+    const hi = baseClose * (1 + sigma);
+    const low = Math.min(lo, hi);
+    const high = Math.max(lo, hi);
+    total += 1;
+    if (actualClose >= low && actualClose <= high) inside += 1;
   }
 
-  const sorted = [...rows].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
-  const cap = 12;
-  for (const row of sorted.slice(0, cap)) {
-    const li = document.createElement("li");
-    li.className = "signal-item";
-    const cls = cusumClass(row.cusum_signal);
-    const when = row.timestamp;
-    const suffix = row.detail ? ` · ${row.detail}` : "";
-    li.innerHTML = `<span class="timestamp">${when}</span><span class="${cls}">${cusumLabel(row.cusum_signal)}${suffix}</span>`;
-    signalListEl.appendChild(li);
-  }
-  if (cusumStatusEl) cusumStatusEl.textContent = `Cusum · ${rows.length} loaded`;
+  if (total === 0) return;
+  const rate = (inside / total) * 100;
+  forecastSuccessRateEl.textContent = `${rate.toFixed(1)}% (${inside}/${total})`;
+  forecastSuccessRateEl.classList.remove("neutral");
+  forecastSuccessRateEl.classList.add(rate >= 50 ? "buy" : "sell");
 }
 
-async function loadCusumSignals() {
-  // Signals panel is optional; if removed from HTML, don't fetch.
-  if (!signalListEl || !cusumStatusEl) return;
-  try {
-    const res = await fetch(CUSUM_JSON_URL, { cache: "no-store" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const payload = (await res.json()) as { signals?: CusumSignalRow[] };
-    const signals = Array.isArray(payload.signals) ? payload.signals : [];
-    renderCusumSignals(signals);
-  } catch {
-    renderCusumSignals([]);
-  }
-}
-
-type ErrorRow = { event_time: string; outside_frac: number | null; side: string | null };
-
-function renderErrorRows(listEl: HTMLUListElement | null, rows: ErrorRow[]) {
-  if (!listEl) return;
-  listEl.innerHTML = "";
-  if (rows.length === 0) {
-    const li = document.createElement("li");
-    li.innerHTML = `<span class="timestamp">—</span><span class="neutral">No errors yet</span>`;
-    listEl.appendChild(li);
-    return;
-  }
-  for (const r of rows.slice(0, 30)) {
-    const t = new Date(r.event_time);
-    const when = Number.isFinite(t.getTime()) ? t.toLocaleTimeString() : r.event_time;
-    const outside = r.outside_frac;
-    const isOk = r.side === "inside" || outside === 0 || outside === null;
-    const msg =
-      isOk || outside === null
-        ? "within band"
-        : `${(outside * 100).toFixed(3)}% ${r.side}`;
-    const li = document.createElement("li");
-    const cls = isOk ? "buy" : "sell";
-    li.innerHTML = `<span class="timestamp">${when}</span><span class="${cls}">${msg}</span>`;
-    listEl.appendChild(li);
-  }
-}
-
-async function loadErrorLog(url: string): Promise<ErrorRow[]> {
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) return [];
-  const payload = (await res.json()) as { errors?: ErrorRow[] };
-  return Array.isArray(payload.errors) ? payload.errors : [];
-}
-
-function setWsStatus(text: string, klass: "buy" | "sell" | "neutral" = "neutral") {
-  if (!wsStatusEl) return;
-  wsStatusEl.textContent = text;
-  wsStatusEl.classList.remove("buy", "sell", "neutral");
-  wsStatusEl.classList.add(klass);
-}
-
-function latestSevenDayClose(): number | null {
-  for (let i = lastSevenDayDisplay.length - 1; i >= 0; i -= 1) {
-    const c = lastSevenDayDisplay[i]?.close;
-    if (typeof c === "number" && Number.isFinite(c)) return c;
-  }
-  return null;
-}
-
-function setActiveGraph(next: "live" | "7d") {
+function setActiveGraph(next: "1h" | "7d") {
   activeGraph = next;
+  const show1h = next === "1h";
+  const show7d = next === "7d";
+  if (graph1hEl) graph1hEl.classList.toggle("is-hidden", !show1h);
+  if (graph7dEl) graph7dEl.classList.toggle("is-hidden", !show7d);
 
-  const showLive = next === "live";
-  if (graphLiveEl) graphLiveEl.classList.toggle("is-hidden", !showLive);
-  if (graph7dEl) graph7dEl.classList.toggle("is-hidden", showLive);
-  if (metricsLiveEl) metricsLiveEl.classList.toggle("is-hidden", !showLive);
-  if (liveChartPriceEl) liveChartPriceEl.classList.toggle("is-hidden", !showLive);
-  if (sevenDayPriceEl) sevenDayPriceEl.classList.toggle("is-hidden", showLive);
+  if (chartTitleEl) {
+    chartTitleEl.textContent = show1h ? `${BINANCE_PAIR} (1h)` : `${BINANCE_PAIR} (7d)`;
+  }
 
-  if (chartTitleEl) chartTitleEl.textContent = showLive ? `${BINANCE_PAIR} $` : `${BINANCE_PAIR} (7d)`;
-
-  if (showLive) {
-    // Keep WS status visible + relevant.
-    if (wsIsOpen) setWsStatus("Live (WS)", "buy");
-    else setWsStatus("Connecting...", "neutral");
-    // Pull σ immediately on entering the live view (don't wait for the next poll tick).
-    void loadCurrentPrice();
-    layoutPriceChartCanvas();
-    drawLiveForecastChart(getLiveForecastSeries);
+  if (show1h) {
+    requestAnimationFrame(() => {
+      if (!oneHourHasLoaded) {
+        void loadOneHourPrices();
+      } else {
+        layoutChart1hCanvas();
+        resizeOneHourChart();
+        drawOneHourChart(lastOneHourDisplay, lastSavedForecasts1h);
+      }
+    });
   } else {
-    // 7d: remove the live marker + show latest daily close.
-    setWsStatus("", "neutral");
-    const p = latestSevenDayClose();
-    if (sevenDayPriceEl) sevenDayPriceEl.textContent = p !== null ? `price: ${p.toFixed(2)}` : "—";
-    // Stop any in-flight live animation so it doesn't keep running.
-    if (priceLabelRaf) cancelAnimationFrame(priceLabelRaf);
-    priceLabelRaf = 0;
-    priceAnimFrom = null;
-    priceAnimTo = null;
-
-    // 7d: only load on demand. Also, force a resize once visible so ApexCharts doesn't render at 0x0.
     requestAnimationFrame(() => {
       if (!sevenDayHasLoaded) {
-        sevenDayHasLoaded = true;
         void loadSevenDayPrices();
       } else {
         layoutChart7dCanvas();
         resizeSevenDayChart();
-        drawSevenDayChart(lastSevenDayDisplay, lastSavedForecasts);
+        drawSevenDayChart(lastSevenDayDisplay, lastSavedForecasts7d);
       }
     });
   }
 }
 
+async function loadOneHourPrices() {
+  if (oneHourLoadInFlight) return oneHourLoadInFlight;
+  oneHourLoadInFlight = (async () => {
+  if (!rest1hStatusEl) return;
+  if (document.visibilityState !== "visible") return;
+  rest1hStatusEl.textContent = "Loading...";
+  rest1hStatusEl.classList.remove("buy", "sell", "neutral");
+  rest1hStatusEl.classList.add("neutral");
+
+  try {
+    const res = await fetch(MARKET_HOURLY_URL, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const payload = (await res.json()) as {
+      candles?: Array<{ open_time: string; close: number }>;
+    };
+    const apiPts = (payload.candles ?? [])
+      .map((c) => ({ open_time: Date.parse(c.open_time), close: Number(c.close) }))
+      .filter((p) => Number.isFinite(p.open_time) && Number.isFinite(p.close))
+      .sort((a, b) => a.open_time - b.open_time);
+    lastOneHourDisplay = hourlyPointsFromApi(apiPts);
+    lastSavedForecasts1h = await loadSavedForecasts1h();
+    layoutChart1hCanvas();
+    resizeOneHourChart();
+    drawOneHourChart(lastOneHourDisplay, lastSavedForecasts1h);
+    updateOneHourKpis(lastOneHourDisplay, lastSavedForecasts1h);
+    oneHourHasLoaded = true;
+    rest1hStatusEl.textContent = "";
+  } catch (e) {
+    oneHourHasLoaded = false;
+    lastOneHourDisplay = [];
+    layoutChart1hCanvas();
+    drawOneHourChart([], lastSavedForecasts1h);
+    updateOneHourKpis([], []);
+    rest1hStatusEl.textContent = "Failed — hourly REST unavailable";
+    console.error("1h fetch", e);
+  }
+  })().finally(() => {
+    oneHourLoadInFlight = null;
+  });
+  return oneHourLoadInFlight;
+}
+
+async function refreshOneHourForecastsOnly() {
+  if (oneHourForecastRefreshInFlight) return oneHourForecastRefreshInFlight;
+  oneHourForecastRefreshInFlight = (async () => {
+    if (document.visibilityState !== "visible") return;
+    if (!oneHourHasLoaded || lastOneHourDisplay.length === 0) return;
+    try {
+      lastSavedForecasts1h = await loadSavedForecasts1h();
+      layoutChart1hCanvas();
+      resizeOneHourChart();
+      drawOneHourChart(lastOneHourDisplay, lastSavedForecasts1h);
+      updateOneHourKpis(lastOneHourDisplay, lastSavedForecasts1h);
+      if (rest1hStatusEl) rest1hStatusEl.textContent = "";
+    } catch (e) {
+      console.error("1h forecast refresh", e);
+    }
+  })().finally(() => {
+    oneHourForecastRefreshInFlight = null;
+  });
+  return oneHourForecastRefreshInFlight;
+}
+
 async function loadSevenDayPrices() {
+  if (sevenDayLoadInFlight) return sevenDayLoadInFlight;
+  sevenDayLoadInFlight = (async () => {
   if (!rest7dStatusEl) return;
   if (document.visibilityState !== "visible") return;
   rest7dStatusEl.textContent = "Loading...";
@@ -544,28 +387,27 @@ async function loadSevenDayPrices() {
       .filter((p) => Number.isFinite(p.open_time) && Number.isFinite(p.close))
       .sort((a, b) => a.open_time - b.open_time);
     const displayPts = dailyPointsFromApi(apiPts);
-    lastSavedForecasts = await loadSavedForecasts();
+    lastSavedForecasts7d = await loadSavedForecasts();
     lastSevenDayDisplay = displayPts;
     layoutChart7dCanvas();
     resizeSevenDayChart();
-    drawSevenDayChart(lastSevenDayDisplay, lastSavedForecasts);
+    drawSevenDayChart(lastSevenDayDisplay, lastSavedForecasts7d);
+    sevenDayHasLoaded = true;
 
-    // When viewing 7d, keep the header price synced to the latest daily close.
-    if (activeGraph === "7d" && sevenDayPriceEl) {
-      const p = latestSevenDayClose();
-      sevenDayPriceEl.textContent = p !== null ? `price: ${p.toFixed(2)}` : "—";
-    }
-
-    renderErrorRows(errors24hListEl, []);
+    updateForecastSuccessRate(lastSevenDayDisplay, lastSavedForecasts7d);
 
     // 24h σ (latest forecast row) + yesterday in-band/out-of-band check (most recent midnight forecast).
-    const { latest, historicalMidnights } = splitForecastRows(lastSavedForecasts);
+    const { latest, historicalMidnights } = splitForecastRows(lastSavedForecasts7d);
     if (vol24hSigmaEl) {
       if (latest && Number.isFinite(latest.garch_forecast) && latest.garch_forecast >= 0) {
         vol24hSigmaEl.textContent = `${(latest.garch_forecast * 100).toFixed(4)}%`;
       } else {
         vol24hSigmaEl.textContent = "—";
       }
+    }
+    if (lastUpdated7dEl) {
+      const ts = latest ? Date.parse(latest.timestamp) : NaN;
+      lastUpdated7dEl.textContent = Number.isFinite(ts) ? formatLocalUpdateTime(ts) : "—";
     }
 
     if (ydayBandEl) {
@@ -610,19 +452,26 @@ async function loadSevenDayPrices() {
     }
 
     rest7dStatusEl.textContent = ``;
-    rest7dStatusEl.classList.remove("neutral");
-    rest7dStatusEl.classList.add("buy");
   } catch (e) {
+    sevenDayHasLoaded = false;
     lastSevenDayDisplay = [];
     layoutChart7dCanvas();
-    drawSevenDayChart([], lastSavedForecasts);
+    drawSevenDayChart([], lastSavedForecasts7d);
     rest7dStatusEl.textContent = "Failed — market daily REST unavailable";
-    rest7dStatusEl.classList.remove("neutral");
-    rest7dStatusEl.classList.add("sell");
     if (vol24hSigmaEl) vol24hSigmaEl.textContent = "—";
     if (ydayBandEl) ydayBandEl.textContent = "—";
+    if (lastUpdated7dEl) lastUpdated7dEl.textContent = "—";
+    if (forecastSuccessRateEl) {
+      forecastSuccessRateEl.textContent = "—";
+      forecastSuccessRateEl.classList.remove("buy", "sell");
+      forecastSuccessRateEl.classList.add("neutral");
+    }
     console.error("7d fetch", e);
   }
+  })().finally(() => {
+    sevenDayLoadInFlight = null;
+  });
+  return sevenDayLoadInFlight;
 }
 
 function msUntilNextSevenDayReloadUtc(): number {
@@ -638,6 +487,22 @@ function msUntilNextSevenDayReloadUtc(): number {
     }
   }
   return 24 * hourMs - elapsedInDayMs;
+}
+
+function msUntilNextHourBoundaryUtc(): number {
+  const now = new Date();
+  const next = new Date(now);
+  next.setUTCHours(now.getUTCHours() + 1, 0, 0, 0);
+  return Math.max(1_000, next.getTime() - now.getTime());
+}
+
+function msUntilNextFiveMinBoundaryUtc(): number {
+  const now = new Date();
+  const next = new Date(now);
+  const m = now.getUTCMinutes();
+  const nextMinuteBucket = Math.floor(m / 5) * 5 + 5;
+  next.setUTCMinutes(nextMinuteBucket, 0, 0);
+  return Math.max(1_000, next.getTime() - now.getTime());
 }
 
 function scheduleSevenDayReloadsTwiceDailyUtc(): void {
@@ -663,74 +528,95 @@ function scheduleSevenDayReloadsTwiceDailyUtc(): void {
   arm();
 }
 
-async function loadCurrentPrice() {
-  if (document.visibilityState !== "visible") return;
-
-  // Pull latest σ (60s band) from API/static JSON.
-  await loadForecasts10sSigma(prices);
-
-  // Anchor the "pending" band only once per poll bucket so it doesn't recenter on every WS tick.
-  if (prices.length > 0) {
-    const now = Date.now();
-    const bucket = Math.floor(now / POLL_MS);
-    if (lastBandRecenterBucket !== bucket) {
-      pendingBandAnchorPrice = prices[prices.length - 1];
-      lastBandRecenterBucket = bucket;
-    }
-  }
-
-  // Recompute the pending band immediately (even if no new WS tick arrived yet).
-  if (prices.length > 0) handleNewSpotPrice(prices[prices.length - 1]);
-}
-
-drawLiveForecastChart(getLiveForecastSeries);
 scheduleSevenDayReloadsTwiceDailyUtc();
-void loadCusumSignals();
 
-let pollTimer: ReturnType<typeof setInterval> | null = null;
-let cusumTimer: ReturnType<typeof setInterval> | null = null;
-function startActiveTimers() {
-  if (pollTimer === null) {
-    void loadCurrentPrice();
-    pollTimer = setInterval(() => void loadCurrentPrice(), POLL_MS);
-  }
-  if (cusumTimer === null) cusumTimer = setInterval(() => void loadCusumSignals(), CUSUM_POLL_MS);
+function scheduleOneHourGraphReloadHourlyUtc(): void {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const disarm = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  const arm = () => {
+    disarm();
+    if (document.visibilityState !== "visible") return;
+    timer = setTimeout(() => {
+      timer = null;
+      void loadOneHourPrices();
+      arm();
+    }, msUntilNextHourBoundaryUtc());
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      // Catch up immediately after tab resumes instead of waiting for next hour boundary.
+      void loadOneHourPrices();
+      arm();
+    } else {
+      disarm();
+    }
+  });
+  arm();
 }
-function stopActiveTimers() {
-  if (pollTimer !== null) clearInterval(pollTimer);
-  pollTimer = null;
-  if (cusumTimer !== null) clearInterval(cusumTimer);
-  cusumTimer = null;
+
+scheduleOneHourGraphReloadHourlyUtc();
+
+function scheduleOneHourForecastRangeRefreshEveryFiveMinUtc(): void {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const disarm = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  const arm = () => {
+    disarm();
+    if (document.visibilityState !== "visible") return;
+    timer = setTimeout(() => {
+      timer = null;
+      void refreshOneHourForecastsOnly();
+      arm();
+    }, msUntilNextFiveMinBoundaryUtc());
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      // Refresh forecast band immediately on resume, then continue 5m cadence.
+      void refreshOneHourForecastsOnly();
+      arm();
+    } else {
+      disarm();
+    }
+  });
+  arm();
 }
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") startActiveTimers();
-  else stopActiveTimers();
-});
-if (document.visibilityState === "visible") startActiveTimers();
+
+scheduleOneHourForecastRangeRefreshEveryFiveMinUtc();
+
+function preloadNonLiveGraphs(): void {
+  if (document.visibilityState !== "visible") return;
+  if (!oneHourHasLoaded) void loadOneHourPrices();
+  if (!sevenDayHasLoaded) void loadSevenDayPrices();
+}
 
 let resizeChartTimer: ReturnType<typeof setTimeout> | undefined;
 window.addEventListener("resize", () => {
   if (resizeChartTimer) clearTimeout(resizeChartTimer);
   resizeChartTimer = setTimeout(() => {
-    if (activeGraph === "live") {
-      layoutPriceChartCanvas();
-      drawLiveForecastChart(getLiveForecastSeries);
+    if (activeGraph === "1h") {
+      layoutChart1hCanvas();
+      drawOneHourChart(lastOneHourDisplay, lastSavedForecasts1h);
     } else {
       layoutChart7dCanvas();
-      drawSevenDayChart(lastSevenDayDisplay, lastSavedForecasts);
+      drawSevenDayChart(lastSevenDayDisplay, lastSavedForecasts7d);
     }
   }, 120);
 });
 
-startLivePriceWs();
-
 if (graphSelectEl) {
   graphSelectEl.addEventListener("change", () => {
-    const v = graphSelectEl.value === "7d" ? "7d" : "live";
+    const v = graphSelectEl.value === "7d" ? "7d" : "1h";
     setActiveGraph(v);
   });
-  // Ensure DOM reflects default selection on initial load.
-  setActiveGraph(graphSelectEl.value === "7d" ? "7d" : "live");
+  setActiveGraph(graphSelectEl.value === "7d" ? "7d" : "1h");
 } else {
-  setActiveGraph("live");
+  setActiveGraph("1h");
 }
+
+// Preload non-live data at site startup so tab switches are instant.
+preloadNonLiveGraphs();
