@@ -25,32 +25,33 @@ def floor_dt_to_step(dt: datetime, step_seconds: int) -> datetime:
 @dataclass
 class LiveGarch11:
     """
-    Lightweight live 1-step σ forecaster for 10s bars.
+    Lightweight live σ forecaster for timeframe bars.
 
     We refit parameters occasionally (slow), then update conditional variance per new bar (fast):
       eps_t = r_t - mu
-      h_{t+1} = omega + alpha * eps_t^2 + beta * h_t
+      h_{t+1} = omega + alpha * eps_t^2 + gamma * I(eps_t < 0) * eps_t^2 + beta * h_t
       sigma_{t+1} = sqrt(h_{t+1}) / 100
 
-    Internals operate on percent returns (log_return * 100) to match `src.model.garch_model`.
+    Internals operate on percent returns (log_return * 100) to match model_testing math.
     """
 
     mu: float
     omega: float
     alpha: float
+    gamma: float
     beta: float
     h_t: float
     last_bar_end: datetime | None = None
 
     @classmethod
-    def fit_from_10s_bars(
+    def fit_from_timeframe_bars(
         cls,
-        bars_10s: pd.DataFrame,
+        bars: pd.DataFrame,
         *,
         mean: str = "Constant",
         dist: str = "normal",
     ) -> "LiveGarch11":
-        df = add_log_returns(bars_10s)
+        df = add_log_returns(bars)
         if df.empty:
             raise ValueError("Not enough data to fit GARCH (empty after returns).")
 
@@ -58,7 +59,7 @@ class LiveGarch11:
         if len(returns_pct) < 20:
             raise ValueError("Not enough returns to fit GARCH robustly (need >= 20).")
 
-        am = arch_model(returns_pct, vol="GARCH", p=1, o=0, q=1, mean=mean, dist=dist)
+        am = arch_model(returns_pct, vol="GARCH", p=1, o=1, q=1, mean=mean, dist=dist)
         res = am.fit(disp="off")
 
         params = res.params.to_dict()
@@ -67,6 +68,7 @@ class LiveGarch11:
         mu = float(params.get("mu", params.get("Const", 0.0)))
         omega = float(params["omega"])
         alpha = float(params.get("alpha[1]", params.get("alpha[0]")))
+        gamma = float(params.get("gamma[1]", params.get("gamma[0]", 0.0)))
         beta = float(params.get("beta[1]", params.get("beta[0]")))
 
         cv = pd.Series(res.conditional_volatility).dropna()
@@ -74,12 +76,13 @@ class LiveGarch11:
             raise ValueError("Model fit produced no conditional volatility.")
         h_t = float(cv.iloc[-1] ** 2)  # percent^2
 
-        return cls(mu=mu, omega=omega, alpha=alpha, beta=beta, h_t=h_t)
+        return cls(mu=mu, omega=omega, alpha=alpha, gamma=gamma, beta=beta, h_t=h_t)
 
     def update_with_return_pct(self, r_t_pct: float) -> float:
         """Update state with newest percent return; return σ forecast for next 10s bar (fraction)."""
         eps = float(r_t_pct) - self.mu
-        h_next = self.omega + self.alpha * (eps**2) + self.beta * self.h_t
+        neg = 1.0 if eps < 0 else 0.0
+        h_next = self.omega + self.alpha * (eps**2) + self.gamma * neg * (eps**2) + self.beta * self.h_t
         if not np.isfinite(h_next) or h_next <= 0:
             # If numerically unstable, do not update state; return NaN to signal caller.
             return float("nan")
@@ -88,9 +91,12 @@ class LiveGarch11:
 
     def sigma_horizon(self, horizon_steps: int) -> float:
         """
-        σ for a multi-step horizon, matching `src.model.garch_model` behavior:
+        σ for a multi-step horizon, matching model-testing aggregation behavior:
         for horizon>1 we aggregate by sqrt(sum of step variances).
         Returns a fraction (not percent).
+
+        For the asymmetric term (gamma), we use E[I(eps<0)] ~= 0.5 in the
+        forward recursion, so phi = alpha + beta + 0.5 * gamma.
         """
         if horizon_steps < 1:
             return float("nan")
@@ -98,7 +104,7 @@ class LiveGarch11:
             return float("nan")
         if horizon_steps == 1:
             return float(np.sqrt(self.h_t) / 100.0)
-        phi = float(self.alpha + self.beta)
+        phi = float(self.alpha + self.beta + 0.5 * self.gamma)
         h = float(self.h_t)
         total = 0.0
         for _ in range(horizon_steps):
@@ -118,11 +124,11 @@ def fetch_recent_10s_bars(
     """Fetch recent 1s klines and aggregate into 10s OHLCV bars."""
     loader = DataLoader(symbol=symbol, exchange_name=exchange_name, timeframe="1s", limit=limit_1s)
     df_1s = loader.load()
-    bars_10s = ohlcv_1s_to_10s(df_1s)
-    if not bars_10s.empty:
-        bars_10s["timestamp"] = pd.to_datetime(bars_10s["timestamp"], utc=True, errors="coerce")
-        bars_10s = bars_10s.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    return bars_10s
+    bars = ohlcv_1s_to_10s(df_1s)
+    if not bars.empty:
+        bars["timestamp"] = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
+        bars = bars.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return bars
 
 
 def fetch_recent_bars(
@@ -145,7 +151,7 @@ def fetch_recent_bars(
 
 
 def latest_closed_10s_return_pct(
-    bars_10s: pd.DataFrame,
+    bars: pd.DataFrame,
     *,
     bar_end: datetime,
 ) -> tuple[float, float] | None:
@@ -153,10 +159,10 @@ def latest_closed_10s_return_pct(
     Compute percent log-return for the bar that ended at `bar_end` versus previous 10s bar.
     Returns (return_pct, close_t) or None if bars missing.
     """
-    if bars_10s.empty:
+    if bars.empty:
         return None
-    ts = pd.to_datetime(bars_10s["timestamp"], utc=True, errors="coerce")
-    work = bars_10s.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
+    ts = pd.to_datetime(bars["timestamp"], utc=True, errors="coerce")
+    work = bars.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
 
     # Prefer the bar that ended exactly at `bar_end`, but tolerate exchange / fetch lag by
     # falling back to the newest bar with timestamp <= bar_end.

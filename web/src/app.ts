@@ -33,10 +33,12 @@ const rest1hStatusEl = document.getElementById("rest-1h-status");
 const vol1hSigmaEl = document.getElementById("vol-1h-sigma");
 const inBound1hEl = document.getElementById("in-bound-1h");
 const lastUpdated1hEl = document.getElementById("last-updated-1h");
+const until1hEl = document.getElementById("until-1h");
 const forecastSuccessRate1hEl = document.getElementById("forecast-success-rate-1h");
 const vol24hSigmaEl = document.getElementById("vol-24h-sigma");
 const ydayBandEl = document.getElementById("yday-band");
 const lastUpdated7dEl = document.getElementById("last-updated-7d");
+const until7dEl = document.getElementById("until-7d");
 const forecastSuccessRateEl = document.getElementById("forecast-success-rate");
 const graphSelectEl = document.getElementById("graph-select") as HTMLSelectElement | null;
 const graph7dEl = document.getElementById("graph-7d");
@@ -64,9 +66,38 @@ function formatLocalUpdateTime(ms: number): string {
   }).format(new Date(ms));
 }
 
+function nextDisplayHourWithEarlyFlip(nowMs: number): number {
+  const now = new Date(nowMs);
+  const baseNext = new Date(now);
+  baseNext.setMinutes(0, 0, 0);
+  baseNext.setHours(baseNext.getHours() + 1);
+  if (now.getMinutes() >= 50) baseNext.setHours(baseNext.getHours() + 1);
+  return baseNext.getTime();
+}
+
+function nextDisplayDayWithEarlyFlip(nowMs: number): number {
+  const now = new Date(nowMs);
+  const nextMidnight = new Date(now);
+  nextMidnight.setHours(24, 0, 0, 0);
+  if (now.getHours() >= 22) nextMidnight.setDate(nextMidnight.getDate() + 1);
+  return nextMidnight.getTime();
+}
+
+function formatLocalDateTime(ms: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZoneName: "short",
+  }).format(new Date(ms));
+}
+
 function updateOneHourKpis(points: HourlyPoint[], forecasts: SavedForecast[]) {
   if (vol1hSigmaEl) vol1hSigmaEl.textContent = "—";
   if (lastUpdated1hEl) lastUpdated1hEl.textContent = "—";
+  if (until1hEl) until1hEl.textContent = "—";
   if (inBound1hEl) {
     inBound1hEl.textContent = "—";
     inBound1hEl.classList.remove("buy", "sell", "neutral");
@@ -88,7 +119,11 @@ function updateOneHourKpis(points: HourlyPoint[], forecasts: SavedForecast[]) {
       if (Number.isFinite(s)) vol1hSigmaEl.textContent = `${(s * 100).toFixed(4)}%`;
       if (lastUpdated1hEl) {
         const ts = Date.parse(latestForecast.timestamp);
-        if (Number.isFinite(ts)) lastUpdated1hEl.textContent = formatLocalUpdateTime(ts);
+        if (Number.isFinite(ts)) {
+          const untilMs = nextDisplayHourWithEarlyFlip(Date.now());
+          lastUpdated1hEl.textContent = formatLocalUpdateTime(ts);
+          if (until1hEl) until1hEl.textContent = formatLocalDateTime(untilMs);
+        }
       }
     }
   }
@@ -407,7 +442,14 @@ async function loadSevenDayPrices() {
     }
     if (lastUpdated7dEl) {
       const ts = latest ? Date.parse(latest.timestamp) : NaN;
-      lastUpdated7dEl.textContent = Number.isFinite(ts) ? formatLocalUpdateTime(ts) : "—";
+      if (Number.isFinite(ts)) {
+        const untilMs = nextDisplayDayWithEarlyFlip(Date.now());
+        lastUpdated7dEl.textContent = formatLocalUpdateTime(ts);
+        if (until7dEl) until7dEl.textContent = formatLocalDateTime(untilMs);
+      } else {
+        lastUpdated7dEl.textContent = "—";
+        if (until7dEl) until7dEl.textContent = "—";
+      }
     }
 
     if (ydayBandEl) {

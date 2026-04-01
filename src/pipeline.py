@@ -3,7 +3,7 @@ import pandas as pd
 from typing import Callable
 import src.features as features
 from src.features import add_log_returns
-from src.model import volatility_baseline_model, garch_model
+from src.model_testing import volatility_baseline_model, garch_model
 from src.evaluation import error_calculation, mae_print, rmse_print
 from src.signal import CusumSignal
 

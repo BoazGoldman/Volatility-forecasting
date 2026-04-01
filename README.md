@@ -21,10 +21,12 @@ BTC/USDT volatility forecasting loop + dashboard:
 
 ## Local Development
 
+Run the frontend locally:
+
 ```bash
 cd web
 npm install
-npx vite
+npm run dev
 ```
 
 Open `http://localhost:5173`.

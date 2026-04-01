@@ -173,7 +173,7 @@ def _write_one_hour_forecast_at(*, forecast_time_utc: datetime) -> tuple[bool, s
         return False, "fetch returned empty bars"
 
     try:
-        model = LiveGarch11.fit_from_10s_bars(bars_5m)
+        model = LiveGarch11.fit_from_timeframe_bars(bars_5m)
     except Exception as exc:
         return False, f"fit failed: {exc}"
 
@@ -219,7 +219,7 @@ def _write_daily_24h_forecast_at(*, forecast_time_utc: datetime) -> tuple[bool, 
         return False, "fetch returned empty bars"
 
     try:
-        model = LiveGarch11.fit_from_10s_bars(bars_1h)
+        model = LiveGarch11.fit_from_timeframe_bars(bars_1h)
     except Exception as exc:
         return False, f"fit failed: {exc}"
 
@@ -298,7 +298,7 @@ def run_five_minute_1h_forecast_tick(live: LiveGarch11 | None, *, force_refit: b
 
     if force_refit or live is None:
         try:
-            live = LiveGarch11.fit_from_10s_bars(bars_5m)
+            live = LiveGarch11.fit_from_timeframe_bars(bars_5m)
             print("1h@5m (5m bars): refit ok")
         except Exception as exc:
             print(f"1h@5m (5m bars): refit failed: {exc}")
